@@ -5,9 +5,6 @@ import pandas as pd
 from PIL import Image, ImageTk, ImageDraw
 import gspread
 from google.oauth2.service_account import Credentials
-from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
-from googleapiclient.http import MediaIoBaseDownload
 import io
 import socket
 import datetime
@@ -15,11 +12,18 @@ import traceback
 import threading
 
 # --- CONFIGURAÇÕES GLOBAIS ---
-DRIVE_FOLDER_ID = "1RCMUWeYgSvRC45hwyjtdkBnKYgyw3cRR"
+
+# ALTERAÇÃO: Adicionada a variável para o caminho da pasta de imagens.
+# Você DEVE alterar esta linha para o caminho correto onde as imagens estão.
+# Exemplo para pasta local: IMAGE_FOLDER_PATH = r"C:\Users\SeuUsuario\Desktop\ImagensDeAvaliacao"
+# Exemplo para pasta de rede: IMAGE_FOLDER_PATH = r"\\servidor\Compartilhamento\ImagensDeAvaliacao"
+IMAGE_FOLDER_PATH = r".\img_dedos_teste"
+
 SPREADSHEET_ID = "1D-jVs643kqIeGnHhy6Q2Dh4zcZfOn3jLsgv9AujNrII"
+
+# ALTERAÇÃO: Removido o escopo do Google Drive da lista de permissões.
 SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive.readonly"
+    "https://www.googleapis.com/auth/spreadsheets"
 ]
 SERVICE_ACCOUNT_FILE = 'credentials.json'
 try:
@@ -28,12 +32,14 @@ except:
     OPERATOR_ID = "unknown_operator"
 
 # --- LÓGICA DE NEGÓCIO E DADOS (GOOGLE APIS) ---
+
+
 class TaskManager:
+    # ALTERAÇÃO: O construtor __init__ foi simplificado. A inicialização do self.drive_service foi removida.
     def __init__(self):
         try:
             creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
             self.sheet = gspread.authorize(creds).open_by_key(SPREADSHEET_ID).sheet1
-            self.drive_service = build('drive', 'v3', credentials=creds)
             self.df_columns = self.sheet.get_all_records()[0].keys()
         except FileNotFoundError:
             messagebox.showerror("Erro Crítico", f"Arquivo de credenciais '{SERVICE_ACCOUNT_FILE}' não encontrado.")
@@ -71,24 +77,19 @@ class TaskManager:
                 if person_hand_id not in seen_person_hand:
                     seen_person_hand.add(person_hand_id)
                     
-                    # Usar (\.|$) para garantir que a correspondência termine com um ponto ou no final da string.
-                    # Isso é mais robusto que \b para evitar a correspondência de "_dedo1" com "_dedo10".
                     regex_pattern = f"^{person_id}_dedo[1-5](\.|$)"
                     if hand_name == "hand2":
                         regex_pattern = f"^{person_id}_dedo(?:6|7|8|9|10)(\.|$)"
                     
-                    # Usar o DataFrame original (df) para garantir que peguemos todas as tarefas da mão,
-                    # mesmo que algumas já estejam 'em_progresso' por um erro anterior.
                     hand_df = df[df['nome_imagem_digital'].str.contains(regex_pattern, regex=True)].copy()
                     
-                    # Filtrar para garantir que estamos apenas tentando reservar as pendentes
                     pending_hand_df = hand_df[hand_df['status'] == 'pendente']
 
                     if not pending_hand_df.empty:
                         unique_hands.append({
                             "id": person_hand_id,
                             "image_name": f"column_{person_hand_id}.png",
-                            "tasks": pending_hand_df # Apenas as pendentes são passadas adiante
+                            "tasks": pending_hand_df
                         })
                 if len(unique_hands) >= batch_size:
                     break
@@ -114,31 +115,36 @@ class TaskManager:
         
         return unique_hands, None
 
-    def download_image_batch(self, hands_to_download, progress_callback):
-        downloaded_images = {}
-        for i, hand in enumerate(hands_to_download):
-            image_name = hand["image_name"]
-            progress_callback(f"Baixando: {image_name} ({i+1}/{len(hands_to_download)})")
-            try:
-                query = f"name='{image_name}' and '{DRIVE_FOLDER_ID}' in parents"
-                response = self.drive_service.files().list(q=query, spaces='drive', fields='files(id, name)').execute()
-                files = response.get('files', [])
-                if not files:
-                    raise FileNotFoundError(f"Imagem '{image_name}' não encontrada no Google Drive.")
+    # ALTERAÇÃO: A função process_image_batch foi completamente reescrita.
+    def process_image_batch(self, hands_to_process, progress_callback):
+        processed_image = {}
+        total_hands = len(hands_to_process)
 
-                request = self.drive_service.files().get_media(fileId=files[0].get('id'))
-                file_bytes = io.BytesIO()
-                downloader = MediaIoBaseDownload(file_bytes, request)
-                done = False
-                while not done:
-                    _, done = downloader.next_chunk()
-                
-                file_bytes.seek(0)
-                downloaded_images[hand["id"]] = Image.open(file_bytes)
+        if not os.path.isdir(IMAGE_FOLDER_PATH):
+            messagebox.showerror("Erro de Configuração", f"O caminho das imagens não foi encontrado ou não é uma pasta válida:\n{IMAGE_FOLDER_PATH}")
+            return {}
+
+        for i, hand in enumerate(hands_to_process):
+            image_name = hand["image_name"]
+            progress_callback(f"Carregando: {image_name} ({i+1}/{total_hands})")
+            
+            full_image_path = os.path.join(IMAGE_FOLDER_PATH, image_name)
+            
+            try:
+                if not os.path.exists(full_image_path):
+                    raise FileNotFoundError(f"Imagem '{image_name}' não encontrada em:\n{full_image_path}")
+
+                image = Image.open(full_image_path)
+                processed_image[hand["id"]] = image
+
+            except FileNotFoundError as e:
+                messagebox.showerror("Erro ao Carregar Imagem", str(e))
+                processed_image[hand["id"]] = None
             except Exception as e:
-                messagebox.showerror("Erro de Download", f"Falha ao baixar {image_name}: {e}")
-                downloaded_images[hand["id"]] = None
-        return downloaded_images
+                messagebox.showerror("Erro Inesperado", f"Falha ao carregar {image_name}: {e}")
+                processed_image[hand["id"]] = None
+        
+        return processed_image
 
     def update_batch_results(self, evaluated_tasks, unevaluated_tasks):
         cells_to_update = []
@@ -202,8 +208,8 @@ class App(ctk.CTk):
     def show_loading_screen(self, batch_size):
         self.show_screen(LoadingScreen, batch_size=batch_size, geometry="500x200", resizable=False)
 
-    def show_evaluation_screen(self, batch_data, downloaded_images):
-        self.show_screen(EvaluationScreen, batch_data=batch_data, downloaded_images=downloaded_images, geometry="1200x800", resizable=True)
+    def show_evaluation_screen(self, batch_data, processed_image):
+        self.show_screen(EvaluationScreen, batch_data=batch_data, processed_image=processed_image, geometry="1200x800", resizable=True)
         # Configura o comportamento de fechamento APÓS a tela de avaliação ter sido criada
         self.protocol("WM_DELETE_WINDOW", self.current_screen.on_closing)
 
@@ -262,21 +268,21 @@ class LoadingScreen(ctk.CTkFrame):
         def progress_callback(message):
             self.progress_label.configure(text=message)
 
-        downloaded_images = self.master.task_manager.download_image_batch(batch_data, progress_callback)
+        processed_image = self.master.task_manager.process_image_batch(batch_data, progress_callback)
         
         # Voltar para a thread principal para atualizar a UI de forma segura
-        self.master.after(0, self.on_loading_complete, batch_data, downloaded_images)
+        self.master.after(0, self.on_loading_complete, batch_data, processed_image)
 
-    def on_loading_complete(self, batch_data, downloaded_images):
-        self.master.show_evaluation_screen(batch_data, downloaded_images)
+    def on_loading_complete(self, batch_data, processed_image):
+        self.master.show_evaluation_screen(batch_data, processed_image)
 
 class EvaluationScreen(ctk.CTkFrame):
-    def __init__(self, master, batch_data, downloaded_images):
+    def __init__(self, master, batch_data, processed_image):
         super().__init__(master)
         self.master = master
         self.task_manager = master.task_manager
         self.batch_data = batch_data
-        self.downloaded_images = downloaded_images
+        self.processed_image = processed_image
         
         self.current_task_index = 0
         self.results = pd.DataFrame() # Armazena resultados localmente
@@ -325,7 +331,7 @@ class EvaluationScreen(ctk.CTkFrame):
         if self.current_task_index == len(self.batch_data) - 1:
             self.next_button.configure(text="Finalizar e Salvar Tudo", fg_color="green")
 
-        original_img = self.downloaded_images.get(current_hand["id"])
+        original_img = self.processed_image.get(current_hand["id"])
         if original_img is None:
             self.col_image_label.configure(text=f"Imagem para\n{current_hand['id']}\nnão foi baixada.", image=None)
             return
