@@ -3,86 +3,65 @@ from tkinter import messagebox, simpledialog
 import os
 import pandas as pd
 from PIL import Image, ImageTk, ImageDraw
+import gspread
+from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+from googleapiclient.http import MediaIoBaseDownload
+import io
 import socket
 import datetime
 import traceback
 import threading
 
 # --- CONFIGURAÇÕES GLOBAIS ---
-
-# ALTERAÇÃO: Adicionada a variável para o caminho do arquivo Excel.
-# Este arquivo será a fonte de verdade para as tarefas de avaliação.
-# Certifique-se de que este arquivo exista e tenha as colunas necessárias.
-EXCEL_FILE_PATH = "avaliacoes.xlsx" # Pode ser um caminho completo, ex: r"C:\temp\avaliacoes.xlsx"
-
-# ALTERAÇÃO: O caminho para a pasta de imagens permanece, mas todas as
-# configurações do Google (Sheets e Drive) foram removidas.
-IMAGE_FOLDER_PATH = "img_dedos_teste"
-
+DRIVE_FOLDER_ID = "1RCMUWeYgSvRC45hwyjtdkBnKYgyw3cRR"
+SPREADSHEET_ID = "1D-jVs643kqIeGnHhy6Q2Dh4zcZfOn3jLsgv9AujNrII"
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive.readonly"
+]
+SERVICE_ACCOUNT_FILE = 'credentials.json'
 try:
     OPERATOR_ID = socket.gethostname()
 except:
     OPERATOR_ID = "unknown_operator"
 
-# --- LÓGICA DE NEGÓCIO E DADOS (ARQUIVO EXCEL LOCAL) ---
-
+# --- LÓGICA DE NEGÓCIO E DADOS (GOOGLE APIS) ---
 class TaskManager:
     def __init__(self):
-        self.excel_path = EXCEL_FILE_PATH
-        # Checa se o arquivo Excel existe na inicialização para dar um erro claro.
-        if not os.path.exists(self.excel_path):
-            messagebox.showerror(
-                "Erro Crítico", 
-                f"O arquivo de avaliações '{self.excel_path}' não foi encontrado.\n\n" \
-                f"Por favor, crie o arquivo com as colunas necessárias: [nome_imagem_digital, bbox_x1, bbox_y1, bbox_x2, bbox_y2, status, etc...]"
-            )
-            raise FileNotFoundError(f"Arquivo de avaliações não encontrado: {self.excel_path}")
-
-    def _read_excel(self) -> pd.DataFrame:
-        """Lê o arquivo Excel e retorna um DataFrame."""
         try:
-            # dtype=str garante que todos os dados sejam lidos como texto para evitar problemas de tipo.
-            return pd.read_excel(self.excel_path, dtype=str)
-        except Exception as e:
-            messagebox.showerror("Erro ao Ler o Arquivo Excel", f"Não foi possível ler o arquivo '{self.excel_path}'.\nErro: {e}")
+            creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
+            self.sheet = gspread.authorize(creds).open_by_key(SPREADSHEET_ID).sheet1
+            self.drive_service = build('drive', 'v3', credentials=creds)
+            self.df_columns = self.sheet.get_all_records()[0].keys()
+        except FileNotFoundError:
+            messagebox.showerror("Erro Crítico", f"Arquivo de credenciais '{SERVICE_ACCOUNT_FILE}' não encontrado.")
             raise
-
-    def _write_excel(self, df: pd.DataFrame):
-        """Escreve o DataFrame de volta para o arquivo Excel."""
-        try:
-            # index=False evita que o pandas escreva uma coluna de índice no Excel.
-            df.to_excel(self.excel_path, index=False)
         except Exception as e:
-            messagebox.showerror("Erro ao Salvar o Arquivo Excel", f"Não foi possível salvar as alterações no arquivo '{self.excel_path}'.\nErro: {e}")
+            messagebox.showerror("Erro de Autenticação", f"Não foi possível conectar aos serviços do Google: {e}")
             raise
 
     def get_all_records_as_df(self):
-        return self._read_excel()
+        all_records = self.sheet.get_all_records()
+        return pd.DataFrame(all_records, dtype=str)
 
     def fetch_and_reserve_batch(self, batch_size: int):
-        df = self._read_excel()
+        df = self.get_all_records_as_df()
         if df.empty:
-            return None, "O arquivo Excel está vazio ou em formato incorreto."
-
-        # CORREÇÃO: Garante que a coluna 'status' exista e remove linhas onde ela é nula
-        if 'status' not in df.columns:
-            return None, "A coluna 'status' não foi encontrada no arquivo Excel."
-        df.dropna(subset=['status', 'nome_imagem_digital'], inplace=True)
+            return None, "Planilha vazia ou em formato incorreto."
 
         pending_df = df[df['status'] == 'pendente'].copy()
         if pending_df.empty:
             return None, "Todas as avaliações foram concluídas!"
 
+        # Identificar mãos únicas pendentes
         unique_hands = []
         seen_person_hand = set()
-        indices_to_reserve = []
 
         for index, row in pending_df.iterrows():
             try:
-                # A verificação de nulo já foi feita acima com dropna, então o código aqui é mais seguro.
-                image_name = row['nome_imagem_digital']
-                parts = os.path.splitext(image_name)[0].split('_')
-                
+                parts = os.path.splitext(row['nome_imagem_digital'])[0].split('_')
                 person_id = parts[0]
                 finger_str = parts[1]
                 finger_num = int(''.join(filter(str.isdigit, finger_str)))
@@ -92,90 +71,104 @@ class TaskManager:
                 if person_hand_id not in seen_person_hand:
                     seen_person_hand.add(person_hand_id)
                     
+                    # Usar (\.|$) para garantir que a correspondência termine com um ponto ou no final da string.
+                    # Isso é mais robusto que \b para evitar a correspondência de "_dedo1" com "_dedo10".
                     regex_pattern = f"^{person_id}_dedo[1-5](\.|$)"
                     if hand_name == "hand2":
                         regex_pattern = f"^{person_id}_dedo(?:6|7|8|9|10)(\.|$)"
                     
-                    # A verificação de nulo com dropna no início da função previne o erro no .str.contains
+                    # Usar o DataFrame original (df) para garantir que peguemos todas as tarefas da mão,
+                    # mesmo que algumas já estejam 'em_progresso' por um erro anterior.
                     hand_df = df[df['nome_imagem_digital'].str.contains(regex_pattern, regex=True)].copy()
+                    
+                    # Filtrar para garantir que estamos apenas tentando reservar as pendentes
                     pending_hand_df = hand_df[hand_df['status'] == 'pendente']
 
                     if not pending_hand_df.empty:
                         unique_hands.append({
                             "id": person_hand_id,
                             "image_name": f"column_{person_hand_id}.png",
-                            "tasks": pending_hand_df
+                            "tasks": pending_hand_df # Apenas as pendentes são passadas adiante
                         })
-                        indices_to_reserve.extend(pending_hand_df.index.tolist())
-
                 if len(unique_hands) >= batch_size:
                     break
             except (IndexError, ValueError):
-                # Este 'continue' agora lida com erros de parsing no nome do arquivo (ex: sem '_')
-                continue
+                continue 
 
         if not unique_hands:
             return None, "Não foi possível encontrar tarefas pendentes válidas."
 
-        # Reservar tarefas modificando o DataFrame e salvando o arquivo de volta.
-        if indices_to_reserve:
-            df.loc[indices_to_reserve, 'status'] = 'em_progresso'
-            df.loc[indices_to_reserve, 'operador_id'] = OPERATOR_ID
-            self._write_excel(df)
+        # Reservar tarefas na planilha
+        cells_to_update = []
+        col_status_idx = list(self.df_columns).index('status') + 1
+        col_op_idx = list(self.df_columns).index('operador_id') + 1
+
+        for hand in unique_hands:
+            for index in hand["tasks"].index:
+                row_num = index + 2
+                cells_to_update.append(gspread.Cell(row_num, col_status_idx, 'em_progresso'))
+                cells_to_update.append(gspread.Cell(row_num, col_op_idx, OPERATOR_ID))
+        
+        if cells_to_update:
+            self.sheet.update_cells(cells_to_update, value_input_option='USER_ENTERED')
         
         return unique_hands, None
 
     def download_image_batch(self, hands_to_download, progress_callback):
         downloaded_images = {}
-        total_hands = len(hands_to_download)
-
-        if not os.path.isdir(IMAGE_FOLDER_PATH):
-            messagebox.showerror("Erro de Configuração", f"O caminho das imagens não foi encontrado ou não é uma pasta válida:\n{IMAGE_FOLDER_PATH}")
-            return {}
-
         for i, hand in enumerate(hands_to_download):
             image_name = hand["image_name"]
-            progress_callback(f"Carregando: {image_name} ({i+1}/{total_hands})")
-            
-            full_image_path = os.path.join(IMAGE_FOLDER_PATH, image_name)
-            
+            progress_callback(f"Baixando: {image_name} ({i+1}/{len(hands_to_download)})")
             try:
-                if not os.path.exists(full_image_path):
-                    raise FileNotFoundError(f"Imagem '{image_name}' não encontrada em:\n{full_image_path}")
+                query = f"name='{image_name}' and '{DRIVE_FOLDER_ID}' in parents"
+                response = self.drive_service.files().list(q=query, spaces='drive', fields='files(id, name)').execute()
+                files = response.get('files', [])
+                if not files:
+                    raise FileNotFoundError(f"Imagem '{image_name}' não encontrada no Google Drive.")
 
-                image = Image.open(full_image_path)
-                downloaded_images[hand["id"]] = image
-
-            except FileNotFoundError as e:
-                messagebox.showerror("Erro ao Carregar Imagem", str(e))
-                downloaded_images[hand["id"]] = None
+                request = self.drive_service.files().get_media(fileId=files[0].get('id'))
+                file_bytes = io.BytesIO()
+                downloader = MediaIoBaseDownload(file_bytes, request)
+                done = False
+                while not done:
+                    _, done = downloader.next_chunk()
+                
+                file_bytes.seek(0)
+                downloaded_images[hand["id"]] = Image.open(file_bytes)
             except Exception as e:
-                messagebox.showerror("Erro Inesperado", f"Falha ao carregar {image_name}: {e}")
+                messagebox.showerror("Erro de Download", f"Falha ao baixar {image_name}: {e}")
                 downloaded_images[hand["id"]] = None
-        
         return downloaded_images
 
     def update_batch_results(self, evaluated_tasks, unevaluated_tasks):
-        df = self._read_excel()
+        cells_to_update = []
         timestamp = datetime.datetime.now().isoformat()
 
-        # Atualiza tarefas concluídas
+        col_f1_idx = list(self.df_columns).index('fator_1_recorte_correto') + 1
+        col_f2_idx = list(self.df_columns).index('fator_2_qualidade_suficiente') + 1
+        col_status_idx = list(self.df_columns).index('status') + 1
+        col_time_idx = list(self.df_columns).index('timestamp_avaliacao') + 1
+        col_op_idx = list(self.df_columns).index('operador_id') + 1
+
+        # Tarefas concluídas
         for index, row_data in evaluated_tasks.iterrows():
-            df.loc[index, 'fator_1_recorte_correto'] = row_data['fator_1_recorte_correto']
-            df.loc[index, 'fator_2_qualidade_suficiente'] = row_data['fator_2_qualidade_suficiente']
-            df.loc[index, 'status'] = 'concluido'
-            df.loc[index, 'timestamp_avaliacao'] = timestamp
+            row_num = int(index) + 2
+            cells_to_update.append(gspread.Cell(row_num, col_f1_idx, row_data['fator_1_recorte_correto']))
+            cells_to_update.append(gspread.Cell(row_num, col_f2_idx, row_data['fator_2_qualidade_suficiente']))
+            cells_to_update.append(gspread.Cell(row_num, col_status_idx, 'concluido'))
+            cells_to_update.append(gspread.Cell(row_num, col_time_idx, timestamp))
 
-        # Libera tarefas não concluídas
+        # Tarefas não concluídas (liberar)
         for index, row_data in unevaluated_tasks.iterrows():
-            df.loc[index, 'status'] = 'pendente'
-            df.loc[index, 'operador_id'] = '' # Limpa o ID do operador
+            row_num = int(index) + 2
+            cells_to_update.append(gspread.Cell(row_num, col_status_idx, 'pendente'))
+            cells_to_update.append(gspread.Cell(row_num, col_op_idx, ''))
 
-        self._write_excel(df)
+        if cells_to_update:
+            self.sheet.update_cells(cells_to_update, value_input_option='USER_ENTERED')
         return True
 
 # --- INTERFACE GRÁFICA ---
-# Nenhuma alteração necessária na interface gráfica.
 class App(ctk.CTk):
     def __init__(self):
         super().__init__()
@@ -211,6 +204,7 @@ class App(ctk.CTk):
 
     def show_evaluation_screen(self, batch_data, downloaded_images):
         self.show_screen(EvaluationScreen, batch_data=batch_data, downloaded_images=downloaded_images, geometry="1200x800", resizable=True)
+        # Configura o comportamento de fechamento APÓS a tela de avaliação ter sido criada
         self.protocol("WM_DELETE_WINDOW", self.current_screen.on_closing)
 
     def show_error_screen(self, message):
@@ -255,6 +249,7 @@ class LoadingScreen(ctk.CTkFrame):
         self.after(100, self.load_data)
 
     def load_data(self):
+        # Executar em uma thread para não bloquear a UI
         threading.Thread(target=self._load_data_thread).start()
 
     def _load_data_thread(self):
@@ -269,6 +264,7 @@ class LoadingScreen(ctk.CTkFrame):
 
         downloaded_images = self.master.task_manager.download_image_batch(batch_data, progress_callback)
         
+        # Voltar para a thread principal para atualizar a UI de forma segura
         self.master.after(0, self.on_loading_complete, batch_data, downloaded_images)
 
     def on_loading_complete(self, batch_data, downloaded_images):
@@ -283,7 +279,7 @@ class EvaluationScreen(ctk.CTkFrame):
         self.downloaded_images = downloaded_images
         
         self.current_task_index = 0
-        self.results = pd.DataFrame()
+        self.results = pd.DataFrame() # Armazena resultados localmente
 
         self.setup_ui()
         self.load_current_task()
@@ -293,6 +289,7 @@ class EvaluationScreen(ctk.CTkFrame):
         self.grid_columnconfigure(2, weight=1)
         self.grid_rowconfigure(0, weight=1)
 
+        # --- Painel de Ações (Esquerda) ---
         actions_frame = ctk.CTkFrame(self, width=200)
         actions_frame.grid(row=0, column=0, sticky="nswe", padx=10, pady=10)
         actions_frame.grid_propagate(False)
@@ -306,15 +303,18 @@ class EvaluationScreen(ctk.CTkFrame):
         self.save_exit_button = ctk.CTkButton(actions_frame, text="Salvar e Sair", command=self.on_closing)
         self.save_exit_button.pack(side="bottom", pady=10, padx=20, fill="x")
 
+        # --- Painel da Coluna (Centro) ---
         col_frame = ctk.CTkFrame(self)
         col_frame.grid(row=0, column=1, sticky="nswe", padx=(0, 10), pady=10)
         self.col_image_label = ctk.CTkLabel(col_frame, text="")
         self.col_image_label.pack(expand=True, fill="both", padx=5, pady=5)
 
+        # --- Painel de Recortes (Direita) ---
         self.crops_frame = ctk.CTkScrollableFrame(self, label_text="Recortes para Avaliação")
         self.crops_frame.grid(row=0, column=2, sticky="nswe", padx=(0, 10), pady=10)
 
     def load_current_task(self):
+        # Limpar widgets antigos
         for widget in self.crops_frame.winfo_children():
             widget.destroy()
 
@@ -364,12 +364,14 @@ class EvaluationScreen(ctk.CTkFrame):
         f1_var = ctk.StringVar(value=data_row.get('fator_1_recorte_correto', ''))
         f2_var = ctk.StringVar(value=data_row.get('fator_2_qualidade_suficiente', ''))
 
+        # Fator 1
         f1_frame = ctk.CTkFrame(widget_frame, fg_color="transparent")
         f1_frame.grid(row=1, column=1, sticky="ew", padx=5)
         ctk.CTkLabel(f1_frame, text="Recorte correto?").pack(side="left")
         ctk.CTkRadioButton(f1_frame, text="Não", variable=f1_var, value="Não").pack(side="right")
         ctk.CTkRadioButton(f1_frame, text="Sim", variable=f1_var, value="Sim").pack(side="right", padx=5)
         
+        # Fator 2
         f2_frame = ctk.CTkFrame(widget_frame, fg_color="transparent")
         f2_frame.grid(row=2, column=1, sticky="ew", padx=5)
         ctk.CTkLabel(f2_frame, text="Qualidade suficiente?").pack(side="left")
@@ -380,11 +382,13 @@ class EvaluationScreen(ctk.CTkFrame):
         self.current_task_df.loc[df_index, 'f2_var'] = f2_var
 
     def next_task(self):
+        # Validar se a tarefa atual foi concluída
         for index, row in self.current_task_df.iterrows():
             if not row['f1_var'].get() or not row['f2_var'].get():
                 messagebox.showwarning("Atenção", "Por favor, avalie todos os recortes antes de avançar.")
                 return
         
+        # Salvar resultados da tarefa atual em memória
         for index, row in self.current_task_df.iterrows():
             self.current_task_df.loc[index, 'fator_1_recorte_correto'] = row['f1_var'].get()
             self.current_task_df.loc[index, 'fator_2_qualidade_suficiente'] = row['f2_var'].get()
@@ -395,6 +399,7 @@ class EvaluationScreen(ctk.CTkFrame):
             self.current_task_index += 1
             self.load_current_task()
         else:
+            # Chegou ao fim do lote
             self.on_closing(final_save=True)
 
     def on_closing(self, final_save=False):
@@ -402,10 +407,12 @@ class EvaluationScreen(ctk.CTkFrame):
             if not messagebox.askyesno("Confirmar Saída", "Tem certeza que deseja sair? Seu progresso será salvo e as tarefas não concluídas serão liberadas."):
                 return
 
+        # Identificar tarefas não avaliadas no lote
         evaluated_indices = self.results.index
-        all_tasks_df = pd.concat([hand["tasks"] for hand in self.batch_data])
-        all_indices = all_tasks_df.index
+        all_indices = pd.concat([hand["tasks"] for hand in self.batch_data]).index
         unevaluated_indices = all_indices.difference(evaluated_indices)
+        
+        all_tasks_df = pd.concat([hand["tasks"] for hand in self.batch_data])
         unevaluated_df = all_tasks_df.loc[unevaluated_indices]
 
         self.task_manager.update_batch_results(self.results, unevaluated_df)
