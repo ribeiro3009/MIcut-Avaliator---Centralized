@@ -3,8 +3,7 @@ from tkinter import messagebox, simpledialog
 import os
 import pandas as pd
 from PIL import Image, ImageTk, ImageDraw
-import gspread
-from google.oauth2.service_account import Credentials
+import oracledb  # ALTERAÇÃO: Importado para Oracle DB
 import io
 import socket
 import datetime
@@ -13,110 +12,150 @@ import threading
 
 # --- CONFIGURAÇÕES GLOBAIS ---
 
-# ALTERAÇÃO: Adicionada a variável para o caminho da pasta de imagens.
-# Você DEVE alterar esta linha para o caminho correto onde as imagens estão.
-# Exemplo para pasta local: IMAGE_FOLDER_PATH = r"C:\Users\SeuUsuario\Desktop\ImagensDeAvaliacao"
-# Exemplo para pasta de rede: IMAGE_FOLDER_PATH = r"\\servidor\Compartilhamento\ImagensDeAvaliacao"
-IMAGE_FOLDER_PATH = r".\img_dedos_teste"
+# Mantenha esta variável com o caminho para a pasta de imagens.
+IMAGE_FOLDER_PATH = r".\Fingerprints_Colums"
 
-SPREADSHEET_ID = "1D-jVs643kqIeGnHhy6Q2Dh4zcZfOn3jLsgv9AujNrII"
+# --- ALTERAÇÃO: CONFIGURAÇÕES DO BANCO DE DADOS ORACLE ---
+# PREENCHA ESTAS INFORMAÇÕES PARA CONECTAR AO SEU BANCO DE DADOS
+ORACLE_USER = "seu_usuario_aqui"
+ORACLE_PASSWORD = "sua_senha_aqui"
+ORACLE_DSN = "host:porta/service_name"  # Ex: "192.168.1.50:1521/ORCL"
+TABLE_A_GEOMETRY = "Tabela_A"  # Tabela com FILENAME e coordenadas
+TABLE_B_TASKS = "Tabela_B"      # Tabela com status e resultados da avaliação
+JOIN_KEY = "NU_PID"             # Coluna que liga as duas tabelas
+# NOTA: A Tabela B DEVE conter a coluna JOIN_KEY e a coluna 'status'.
 
-# ALTERAÇÃO: Removido o escopo do Google Drive da lista de permissões.
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets"
-]
-SERVICE_ACCOUNT_FILE = 'credentials.json'
 try:
     OPERATOR_ID = socket.gethostname()
 except:
     OPERATOR_ID = "unknown_operator"
 
-# --- LÓGICA DE NEGÓCIO E DADOS (GOOGLE APIS) ---
-
+# --- LÓGICA DE NEGÓCIO E DADOS (ORACLE DB) ---
 
 class TaskManager:
-    # ALTERAÇÃO: O construtor __init__ foi simplificado. A inicialização do self.drive_service foi removida.
     def __init__(self):
+        """Inicializa o TaskManager e estabelece conexão com o Oracle DB."""
+        self.conn = None
         try:
-            creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
-            self.sheet = gspread.authorize(creds).open_by_key(SPREADSHEET_ID).sheet1
-            self.df_columns = self.sheet.get_all_records()[0].keys()
-        except FileNotFoundError:
-            messagebox.showerror("Erro Crítico", f"Arquivo de credenciais '{SERVICE_ACCOUNT_FILE}' não encontrado.")
+            self.conn = oracledb.connect(user=ORACLE_USER, password=ORACLE_PASSWORD, dsn=ORACLE_DSN)
+            # Testa se as tabelas existem e são acessíveis
+            with self.conn.cursor() as cursor:
+                cursor.execute(f"SELECT 1 FROM {TABLE_A_GEOMETRY} WHERE 1=0")
+                cursor.execute(f"SELECT 1 FROM {TABLE_B_TASKS} WHERE 1=0")
+        except oracledb.DatabaseError as e:
+            messagebox.showerror("Erro de Banco de Dados", f"Não foi possível conectar ou encontrar as tabelas no Oracle DB: {e}\n\nVerifique as configurações em main.py (TABLE_A_GEOMETRY, TABLE_B_TASKS).")
             raise
         except Exception as e:
-            messagebox.showerror("Erro de Autenticação", f"Não foi possível conectar aos serviços do Google: {e}")
+            messagebox.showerror("Erro Crítico na Inicialização", f"Ocorreu um erro inesperado: {e}")
             raise
 
-    def get_all_records_as_df(self):
-        all_records = self.sheet.get_all_records()
-        return pd.DataFrame(all_records, dtype=str)
+    def __del__(self):
+        """Garante que a conexão com o banco de dados seja fechada."""
+        if self.conn:
+            self.conn.close()
 
     def fetch_and_reserve_batch(self, batch_size: int):
-        df = self.get_all_records_as_df()
-        if df.empty:
-            return None, "Planilha vazia ou em formato incorreto."
+        """Busca um lote de tarefas, reservando-as no banco de dados de forma atômica."""
+        try:
+            with self.conn.cursor() as cursor:
+                self.conn.autocommit = False
 
-        pending_df = df[df['status'] == 'pendente'].copy()
-        if pending_df.empty:
-            return None, "Todas as avaliações foram concluídas!"
+                # 1. Busca todas as tarefas pendentes fazendo JOIN entre as tabelas
+                sql_fetch_pending = f"""
+                    SELECT
+                        b.{JOIN_KEY}, b.status, a.FILENAME,
+                        a.BOX_X, a.BOX_Y, a.BOX_W, a.BOX_H
+                    FROM
+                        {TABLE_B_TASKS} b
+                    JOIN
+                        {TABLE_A_GEOMETRY} a ON b.{JOIN_KEY} = a.{JOIN_KEY}
+                    WHERE
+                        b.status = 'PENDENTE'
+                """
+                cursor.execute(sql_fetch_pending)
+                
+                db_columns = [desc[0].lower() for desc in cursor.description]
+                pending_df = pd.DataFrame(cursor.fetchall(), columns=db_columns)
 
-        # Identificar mãos únicas pendentes
-        unique_hands = []
-        seen_person_hand = set()
+                if pending_df.empty:
+                    return None, "Todas as avaliações foram concluídas!"
 
-        for index, row in pending_df.iterrows():
-            try:
-                parts = os.path.splitext(row['nome_imagem_digital'])[0].split('_')
-                person_id = parts[0]
-                finger_str = parts[1]
-                finger_num = int(''.join(filter(str.isdigit, finger_str)))
-                hand_name = "hand1" if 1 <= finger_num <= 5 else "hand2"
-                person_hand_id = f"{person_id}_{hand_name}"
+                # 2. Renomeia colunas para manter a compatibilidade com o resto do código
+                rename_map = {
+                    JOIN_KEY.lower(): 'id',
+                    'filename': 'nome_imagem_digital',
+                    'box_x': 'bbox_x1',
+                    'box_y': 'bbox_y1',
+                    'box_w': 'bbox_x2',
+                    'box_h': 'bbox_y2'
+                }
+                pending_df.rename(columns=rename_map, inplace=True)
+                pending_df.set_index('id', inplace=True)
 
-                if person_hand_id not in seen_person_hand:
-                    seen_person_hand.add(person_hand_id)
-                    
-                    regex_pattern = f"^{person_id}_dedo[1-5](\.|$)"
-                    if hand_name == "hand2":
-                        regex_pattern = f"^{person_id}_dedo(?:6|7|8|9|10)(\.|$)"
-                    
-                    hand_df = df[df['nome_imagem_digital'].str.contains(regex_pattern, regex=True)].copy()
-                    
-                    pending_hand_df = hand_df[hand_df['status'] == 'pendente']
+                # 3. Agrupa tarefas por "mão" (hand), replicando a lógica original
+                def get_person_hand_id(image_name):
+                    try:
+                        parts = os.path.splitext(str(image_name))[0].split('_')
+                        person_id = parts[0]
+                        finger_str = parts[1]
+                        finger_num = int("".join(filter(str.isdigit, finger_str)))
+                        hand_name = "hand1" if 1 <= finger_num <= 5 else "hand2"
+                        return f"{person_id}_{hand_name}"
+                    except (IndexError, ValueError):
+                        return None
+                
+                pending_df['person_hand_id'] = pending_df['nome_imagem_digital'].apply(get_person_hand_id)
+                pending_df.dropna(subset=['person_hand_id'], inplace=True)
 
-                    if not pending_hand_df.empty:
-                        unique_hands.append({
-                            "id": person_hand_id,
-                            "image_name": f"column_{person_hand_id}.png",
-                            "tasks": pending_hand_df
-                        })
-                if len(unique_hands) >= batch_size:
-                    break
-            except (IndexError, ValueError):
-                continue 
+                unique_hand_ids = pending_df['person_hand_id'].unique()
+                if len(unique_hand_ids) == 0:
+                    return None, "Não foi possível encontrar tarefas pendentes com formato de nome válido."
 
-        if not unique_hands:
-            return None, "Não foi possível encontrar tarefas pendentes válidas."
+                # 4. Seleciona o lote de mãos e reserva as tarefas
+                batch_hand_ids = unique_hand_ids[:batch_size]
+                tasks_to_reserve_df = pending_df[pending_df['person_hand_id'].isin(batch_hand_ids)].copy()
+                task_ids_to_reserve = tasks_to_reserve_df.index.tolist()
 
-        # Reservar tarefas na planilha
-        cells_to_update = []
-        col_status_idx = list(self.df_columns).index('status') + 1
-        col_op_idx = list(self.df_columns).index('operador_id') + 1
+                if not task_ids_to_reserve:
+                    return None, "Nenhuma tarefa encontrada para o lote selecionado."
 
-        for hand in unique_hands:
-            for index in hand["tasks"].index:
-                row_num = index + 2
-                cells_to_update.append(gspread.Cell(row_num, col_status_idx, 'em_progresso'))
-                cells_to_update.append(gspread.Cell(row_num, col_op_idx, OPERATOR_ID))
-        
-        if cells_to_update:
-            self.sheet.update_cells(cells_to_update, value_input_option='USER_ENTERED')
-        
-        return unique_hands, None
+                # 5. Bloqueia e atualiza as linhas na Tabela B (de tarefas)
+                id_placeholders = ", ".join([f":id{i+1}" for i in range(len(task_ids_to_reserve))])
+                lock_sql = f"SELECT {JOIN_KEY} FROM {TABLE_B_TASKS} WHERE {JOIN_KEY} IN ({id_placeholders}) AND status = 'PENDENTE' FOR UPDATE"
+                cursor.execute(lock_sql, task_ids_to_reserve)
+                
+                locked_rows = cursor.fetchall()
+                if len(locked_rows) != len(task_ids_to_reserve):
+                    self.conn.rollback()
+                    return None, "Conflito de reserva. Outro operador pode ter pego estas tarefas. Tente novamente."
 
-    # ALTERAÇÃO: A função process_image_batch foi completamente reescrita.
+                update_sql = f"UPDATE {TABLE_B_TASKS} SET status = 'EM_PROCESSAMENTO', operador_id = :op_id WHERE {JOIN_KEY} = :task_id"
+                update_data = [{'op_id': OPERATOR_ID, 'task_id': int(task_id)} for task_id in task_ids_to_reserve]
+                cursor.executemany(update_sql, update_data)
+                
+                self.conn.commit()
+
+                # 6. Formata os dados para a interface gráfica (lógica inalterada)
+                unique_hands = []
+                for hand_id in batch_hand_ids:
+                    hand_tasks_df = tasks_to_reserve_df[tasks_to_reserve_df['person_hand_id'] == hand_id]
+                    unique_hands.append({
+                        "id": hand_id,
+                        "image_name": f"column_{hand_id}.png",
+                        "tasks": hand_tasks_df
+                    })
+                
+                return unique_hands, None
+
+        except oracledb.DatabaseError as e:
+            if self.conn: self.conn.rollback()
+            return None, f"Erro no banco de dados durante a busca: {e}"
+        finally:
+            if self.conn: self.conn.autocommit = True
+
+
     def process_image_batch(self, hands_to_process, progress_callback):
+        """Carrega as imagens das mãos a serem processadas. (Lógica inalterada)"""
         processed_image = {}
         total_hands = len(hands_to_process)
 
@@ -147,34 +186,49 @@ class TaskManager:
         return processed_image
 
     def update_batch_results(self, evaluated_tasks, unevaluated_tasks):
-        cells_to_update = []
-        timestamp = datetime.datetime.now().isoformat()
+        """Atualiza os resultados do lote no banco de dados."""
+        try:
+            with self.conn.cursor() as cursor:
+                self.conn.autocommit = False
+                timestamp = datetime.datetime.now()
 
-        col_f1_idx = list(self.df_columns).index('fator_1_recorte_correto') + 1
-        col_f2_idx = list(self.df_columns).index('fator_2_qualidade_suficiente') + 1
-        col_status_idx = list(self.df_columns).index('status') + 1
-        col_time_idx = list(self.df_columns).index('timestamp_avaliacao') + 1
-        col_op_idx = list(self.df_columns).index('operador_id') + 1
+                # Tarefas concluídas: Atualiza a Tabela B
+                if not evaluated_tasks.empty:
+                    update_eval_sql = f"""
+                        UPDATE {TABLE_B_TASKS}
+                        SET fator_1_recorte_correto = :f1,
+                            fator_2_qualidade_suficiente = :f2,
+                            status = 'CONCLUIDO',
+                            timestamp_avaliacao = :ts
+                        WHERE {JOIN_KEY} = :task_id
+                    """
+                    eval_data = [
+                        {
+                            'f1': row['fator_1_recorte_correto'],
+                            'f2': row['fator_2_qualidade_suficiente'],
+                            'ts': timestamp,
+                            'task_id': int(index)
+                        }
+                        for index, row in evaluated_tasks.iterrows()
+                    ]
+                    cursor.executemany(update_eval_sql, eval_data)
 
-        # Tarefas concluídas
-        for index, row_data in evaluated_tasks.iterrows():
-            row_num = int(index) + 2
-            cells_to_update.append(gspread.Cell(row_num, col_f1_idx, row_data['fator_1_recorte_correto']))
-            cells_to_update.append(gspread.Cell(row_num, col_f2_idx, row_data['fator_2_qualidade_suficiente']))
-            cells_to_update.append(gspread.Cell(row_num, col_status_idx, 'concluido'))
-            cells_to_update.append(gspread.Cell(row_num, col_time_idx, timestamp))
+                # Tarefas não concluídas (liberar): Atualiza a Tabela B
+                if not unevaluated_tasks.empty:
+                    update_uneval_sql = f"UPDATE {TABLE_B_TASKS} SET status = 'PENDENTE', operador_id = NULL WHERE {JOIN_KEY} = :task_id"
+                    uneval_data = [{'task_id': int(index)} for index, row in unevaluated_tasks.iterrows()]
+                    cursor.executemany(update_uneval_sql, uneval_data)
 
-        # Tarefas não concluídas (liberar)
-        for index, row_data in unevaluated_tasks.iterrows():
-            row_num = int(index) + 2
-            cells_to_update.append(gspread.Cell(row_num, col_status_idx, 'pendente'))
-            cells_to_update.append(gspread.Cell(row_num, col_op_idx, ''))
+                self.conn.commit()
+                return True
+        except oracledb.DatabaseError as e:
+            if self.conn: self.conn.rollback()
+            messagebox.showerror("Erro de Banco de Dados", f"Falha ao salvar resultados: {e}")
+            return False
+        finally:
+            if self.conn: self.conn.autocommit = True
 
-        if cells_to_update:
-            self.sheet.update_cells(cells_to_update, value_input_option='USER_ENTERED')
-        return True
-
-# --- INTERFACE GRÁFICA ---
+# --- INTERFACE GRÁFICA (Lógica inalterada) ---
 class App(ctk.CTk):
     def __init__(self):
         super().__init__()
@@ -210,7 +264,6 @@ class App(ctk.CTk):
 
     def show_evaluation_screen(self, batch_data, processed_image):
         self.show_screen(EvaluationScreen, batch_data=batch_data, processed_image=processed_image, geometry="1200x800", resizable=True)
-        # Configura o comportamento de fechamento APÓS a tela de avaliação ter sido criada
         self.protocol("WM_DELETE_WINDOW", self.current_screen.on_closing)
 
     def show_error_screen(self, message):
@@ -255,22 +308,22 @@ class LoadingScreen(ctk.CTkFrame):
         self.after(100, self.load_data)
 
     def load_data(self):
-        # Executar em uma thread para não bloquear a UI
         threading.Thread(target=self._load_data_thread).start()
 
     def _load_data_thread(self):
         batch_data, error = self.master.task_manager.fetch_and_reserve_batch(self.batch_size)
         if error:
-            messagebox.showerror("Erro", error)
-            self.master.show_batch_selection_screen()
+            # Como estamos em outra thread, precisamos agendar a chamada para a thread principal da UI
+            self.master.after(0, lambda: messagebox.showerror("Erro", error))
+            self.master.after(0, self.master.show_batch_selection_screen)
             return
 
         def progress_callback(message):
-            self.progress_label.configure(text=message)
+            # Agendar atualização do label na thread da UI
+            self.master.after(0, self.progress_label.configure, {"text": message})
 
         processed_image = self.master.task_manager.process_image_batch(batch_data, progress_callback)
         
-        # Voltar para a thread principal para atualizar a UI de forma segura
         self.master.after(0, self.on_loading_complete, batch_data, processed_image)
 
     def on_loading_complete(self, batch_data, processed_image):
@@ -285,7 +338,8 @@ class EvaluationScreen(ctk.CTkFrame):
         self.processed_image = processed_image
         
         self.current_task_index = 0
-        self.results = pd.DataFrame() # Armazena resultados localmente
+        # O DataFrame de resultados usará o ID da tarefa (do DB) como índice
+        self.results = pd.DataFrame()
 
         self.setup_ui()
         self.load_current_task()
@@ -295,7 +349,6 @@ class EvaluationScreen(ctk.CTkFrame):
         self.grid_columnconfigure(2, weight=1)
         self.grid_rowconfigure(0, weight=1)
 
-        # --- Painel de Ações (Esquerda) ---
         actions_frame = ctk.CTkFrame(self, width=200)
         actions_frame.grid(row=0, column=0, sticky="nswe", padx=10, pady=10)
         actions_frame.grid_propagate(False)
@@ -309,22 +362,20 @@ class EvaluationScreen(ctk.CTkFrame):
         self.save_exit_button = ctk.CTkButton(actions_frame, text="Salvar e Sair", command=self.on_closing)
         self.save_exit_button.pack(side="bottom", pady=10, padx=20, fill="x")
 
-        # --- Painel da Coluna (Centro) ---
         col_frame = ctk.CTkFrame(self)
         col_frame.grid(row=0, column=1, sticky="nswe", padx=(0, 10), pady=10)
         self.col_image_label = ctk.CTkLabel(col_frame, text="")
         self.col_image_label.pack(expand=True, fill="both", padx=5, pady=5)
 
-        # --- Painel de Recortes (Direita) ---
         self.crops_frame = ctk.CTkScrollableFrame(self, label_text="Recortes para Avaliação")
         self.crops_frame.grid(row=0, column=2, sticky="nswe", padx=(0, 10), pady=10)
 
     def load_current_task(self):
-        # Limpar widgets antigos
         for widget in self.crops_frame.winfo_children():
             widget.destroy()
 
         current_hand = self.batch_data[self.current_task_index]
+        # O .copy() é importante para evitar SettingWithCopyWarning
         self.current_task_df = current_hand["tasks"].copy()
         
         self.progress_label.configure(text=f"Avaliando Mão {self.current_task_index + 1} de {len(self.batch_data)}")
@@ -333,17 +384,18 @@ class EvaluationScreen(ctk.CTkFrame):
 
         original_img = self.processed_image.get(current_hand["id"])
         if original_img is None:
-            self.col_image_label.configure(text=f"Imagem para\n{current_hand['id']}\nnão foi baixada.", image=None)
+            self.col_image_label.configure(text=f"Imagem para\n{current_hand['id']}\nnão foi carregada.", image=None)
             return
 
         display_img = original_img.copy()
         draw = ImageDraw.Draw(display_img, "RGBA")
         
-        for index, row in self.current_task_df.iterrows():
+        # O índice do DataFrame (df_index) agora é o ID da tarefa no banco de dados
+        for df_index, row in self.current_task_df.iterrows():
             box = (int(row['bbox_x1']), int(row['bbox_y1']), int(row['bbox_x2']), int(row['bbox_y2']))
             draw.rectangle(box, outline="red", width=3)
             crop_image_obj = original_img.crop(box)
-            self.create_crop_widget(index, row, crop_image_obj)
+            self.create_crop_widget(df_index, row, crop_image_obj)
 
         w, h = display_img.size
         max_h = 800
@@ -353,10 +405,10 @@ class EvaluationScreen(ctk.CTkFrame):
             display_img = display_img.resize((new_w, max_h), Image.LANCZOS)
 
         ctk_img = ctk.CTkImage(light_image=display_img, size=display_img.size)
-        self.col_image_label.configure(image=ctk_img)
+        self.col_image_label.configure(image=ctk_img, text="")
 
     def create_crop_widget(self, df_index, data_row, crop_image: Image.Image):
-        widget_frame = ctk.CTkFrame(self.crops_frame)
+        widget_frame = ctk.CTkFrame(self)
         widget_frame.pack(fill="x", pady=5, padx=5)
         widget_frame.grid_columnconfigure(1, weight=1)
 
@@ -367,45 +419,42 @@ class EvaluationScreen(ctk.CTkFrame):
 
         ctk.CTkLabel(widget_frame, text=data_row['nome_imagem_digital'], font=ctk.CTkFont(weight="bold")).grid(row=0, column=1, sticky="w", padx=5)
 
-        f1_var = ctk.StringVar(value=data_row.get('fator_1_recorte_correto', ''))
-        f2_var = ctk.StringVar(value=data_row.get('fator_2_qualidade_suficiente', ''))
+        f1_var = ctk.StringVar(value=str(data_row.get('fator_1_recorte_correto', '')))
+        f2_var = ctk.StringVar(value=str(data_row.get('fator_2_qualidade_suficiente', '')))
 
-        # Fator 1
         f1_frame = ctk.CTkFrame(widget_frame, fg_color="transparent")
         f1_frame.grid(row=1, column=1, sticky="ew", padx=5)
         ctk.CTkLabel(f1_frame, text="Recorte correto?").pack(side="left")
-        ctk.CTkRadioButton(f1_frame, text="Não", variable=f1_var, value="Não").pack(side="right")
-        ctk.CTkRadioButton(f1_frame, text="Sim", variable=f1_var, value="Sim").pack(side="right", padx=5)
+        ctk.CTkRadioButton(f1_frame, text="Não", variable=f1_var, value="NAO").pack(side="right")
+        ctk.CTkRadioButton(f1_frame, text="Sim", variable=f1_var, value="SIM").pack(side="right", padx=5)
         
-        # Fator 2
         f2_frame = ctk.CTkFrame(widget_frame, fg_color="transparent")
         f2_frame.grid(row=2, column=1, sticky="ew", padx=5)
         ctk.CTkLabel(f2_frame, text="Qualidade suficiente?").pack(side="left")
-        ctk.CTkRadioButton(f2_frame, text="Não", variable=f2_var, value="Não").pack(side="right")
-        ctk.CTkRadioButton(f2_frame, text="Sim", variable=f2_var, value="Sim").pack(side="right", padx=5)
+        ctk.CTkRadioButton(f2_frame, text="Não", variable=f2_var, value="NAO").pack(side="right")
+        ctk.CTkRadioButton(f2_frame, text="Sim", variable=f2_var, value="SIM").pack(side="right", padx=5)
 
+        # Armazena as variáveis tkinter para obter os valores mais tarde
         self.current_task_df.loc[df_index, 'f1_var'] = f1_var
         self.current_task_df.loc[df_index, 'f2_var'] = f2_var
 
     def next_task(self):
-        # Validar se a tarefa atual foi concluída
         for index, row in self.current_task_df.iterrows():
             if not row['f1_var'].get() or not row['f2_var'].get():
                 messagebox.showwarning("Atenção", "Por favor, avalie todos os recortes antes de avançar.")
                 return
         
-        # Salvar resultados da tarefa atual em memória
         for index, row in self.current_task_df.iterrows():
             self.current_task_df.loc[index, 'fator_1_recorte_correto'] = row['f1_var'].get()
             self.current_task_df.loc[index, 'fator_2_qualidade_suficiente'] = row['f2_var'].get()
         
-        self.results = pd.concat([self.results, self.current_task_df.drop(columns=['f1_var', 'f2_var'])])
+        # Concatena os resultados da mão atual com os resultados gerais do lote
+        self.results = pd.concat([self.results, self.current_task_df.drop(columns=['f1_var', 'f2_var', 'person_hand_id'])])
 
         if self.current_task_index < len(self.batch_data) - 1:
             self.current_task_index += 1
             self.load_current_task()
         else:
-            # Chegou ao fim do lote
             self.on_closing(final_save=True)
 
     def on_closing(self, final_save=False):
@@ -413,12 +462,12 @@ class EvaluationScreen(ctk.CTkFrame):
             if not messagebox.askyesno("Confirmar Saída", "Tem certeza que deseja sair? Seu progresso será salvo e as tarefas não concluídas serão liberadas."):
                 return
 
-        # Identificar tarefas não avaliadas no lote
+        # Identifica tarefas não avaliadas no lote
         evaluated_indices = self.results.index
-        all_indices = pd.concat([hand["tasks"] for hand in self.batch_data]).index
+        all_tasks_df = pd.concat([hand["tasks"] for hand in self.batch_data])
+        all_indices = all_tasks_df.index
         unevaluated_indices = all_indices.difference(evaluated_indices)
         
-        all_tasks_df = pd.concat([hand["tasks"] for hand in self.batch_data])
         unevaluated_df = all_tasks_df.loc[unevaluated_indices]
 
         self.task_manager.update_batch_results(self.results, unevaluated_df)
