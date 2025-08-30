@@ -13,7 +13,7 @@ ORACLE_DSN = "host:porta/service_name"  # Ex: "192.168.1.50:1521/ORCL"
 TABLE_RECORTE = "FRC.RECORTE"
 
 # Status padrão para todas as novas tarefas
-STATUS_PENDENTE = 1
+STATUS_PENDENTE = 10
 
 def extract_info(filename):
     """Extrai NU_PID e CO_DEDO do nome do arquivo."""

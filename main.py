@@ -28,9 +28,9 @@ TABLE_RECORTE_STATUS = "FRC.RECORTE_STATUS" # Tabela de consulta de status
 
 # Mapeamento dos códigos de status (conforme combinado)
 # Estes valores devem corresponder aos da tabela FRC.RECORTE_STATUS
-STATUS_PENDENTE = 1
-STATUS_EM_PROCESSAMENTO = 2
-STATUS_CONCLUIDO = 3
+STATUS_PENDENTE = 10
+STATUS_EM_PROCESSAMENTO = 20
+STATUS_CONCLUIDO = 40
 
 try:
     OPERATOR_ID = socket.gethostname()
@@ -495,23 +495,49 @@ class EvaluationScreen(ctk.CTkFrame):
 
     def on_closing(self, final_save=False):
         if not final_save:
-            if not messagebox.askyesno("Confirmar Saída", "Tem certeza que deseja sair? Seu progresso será salvo e as tarefas não concluídas serão liberadas."):
+            if not messagebox.askyesno("Confirmar Saída", "Tem certeza que deseja sair? Apenas as MÃOS 100% concluídas serão salvas. O progresso em mãos parcialmente avaliadas será perdido."):
                 return
 
-        # Identifica tarefas não avaliadas no lote
-        evaluated_indices = self.results.index
+        # Lógica para salvar apenas mãos completas
         all_tasks_df = pd.concat([hand["tasks"] for hand in self.batch_data])
-        all_indices = all_tasks_df.index
-        unevaluated_indices = all_indices.difference(evaluated_indices)
-        
-        unevaluated_df = all_tasks_df.loc[unevaluated_indices]
 
-        self.task_manager.update_batch_results(self.results, unevaluated_df)
+        completed_hand_ids = []
+        if not self.results.empty:
+            # Agrupa os dedos avaliados por 'mão'
+            evaluated_fingers_by_hand = self.results.groupby('person_hand_id')
+
+            for hand_data in self.batch_data:
+                hand_id = hand_data["id"]
+                total_fingers_in_hand = len(hand_data["tasks"])
+                
+                # Verifica se a mão teve algum dedo avaliado
+                if hand_id in evaluated_fingers_by_hand.groups:
+                    evaluated_count = len(evaluated_fingers_by_hand.get_group(hand_id))
+                    # Se todos os dedos da mão foram avaliados, marca a mão como completa
+                    if evaluated_count == total_fingers_in_hand:
+                        completed_hand_ids.append(hand_id)
+
+        # Separa os dataframes com base nas mãos completas
+        tasks_to_save_df = all_tasks_df[all_tasks_df['person_hand_id'].isin(completed_hand_ids)]
+        tasks_to_release_df = all_tasks_df[~all_tasks_df['person_hand_id'].isin(completed_hand_ids)]
+
+        # Adiciona os resultados da avaliação ao dataframe que será salvo
+        if not tasks_to_save_df.empty:
+            # Garante que o dataframe de resultados tenha o mesmo tipo de índice que o de tarefas
+            results_to_merge = self.results.reset_index().set_index(['nu_pid', 'co_dedo'])
+            tasks_to_save_df = tasks_to_save_df.merge(
+                results_to_merge[['fator_1_recorte_correto', 'fator_2_qualidade_suficiente']],
+                left_index=True,
+                right_index=True,
+                how='left'
+            )
+
+        self.task_manager.update_batch_results(tasks_to_save_df, tasks_to_release_df)
         
         if final_save:
             messagebox.showinfo("Sucesso", "Lote de avaliação concluído e salvo com sucesso!")
         else:
-            messagebox.showinfo("Progresso Salvo", "Seu progresso foi salvo. As tarefas restantes foram liberadas.")
+            messagebox.showinfo("Progresso Salvo", "Seu progresso foi salvo. Tarefas de mãos incompletas foram liberadas.")
 
         self.master.protocol("WM_DELETE_WINDOW", self.master.destroy)
         self.master.show_batch_selection_screen()
