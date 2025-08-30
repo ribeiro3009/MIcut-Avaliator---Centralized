@@ -20,10 +20,17 @@ IMAGE_FOLDER_PATH = r".\Fingerprints_Colums"
 ORACLE_USER = "seu_usuario_aqui"
 ORACLE_PASSWORD = "sua_senha_aqui"
 ORACLE_DSN = "host:porta/service_name"  # Ex: "192.168.1.50:1521/ORCL"
-TABLE_A_GEOMETRY = "Tabela_A"  # Tabela com FILENAME e coordenadas
-TABLE_B_TASKS = "Tabela_B"      # Tabela com status e resultados da avaliação
-JOIN_KEY = "NU_PID"             # Coluna que liga as duas tabelas
-# NOTA: A Tabela B DEVE conter a coluna JOIN_KEY e a coluna 'status'.
+
+# Nomes das tabelas conforme a nova estrutura
+TABLE_RECORTE = "FRC.RECORTE"
+TABLE_RECORTE_ANALISE = "FRC.RECORTE_ANALISE"
+TABLE_RECORTE_STATUS = "FRC.RECORTE_STATUS" # Tabela de consulta de status
+
+# Mapeamento dos códigos de status (conforme combinado)
+# Estes valores devem corresponder aos da tabela FRC.RECORTE_STATUS
+STATUS_PENDENTE = 1
+STATUS_EM_PROCESSAMENTO = 2
+STATUS_CONCLUIDO = 3
 
 try:
     OPERATOR_ID = socket.gethostname()
@@ -40,10 +47,10 @@ class TaskManager:
             self.conn = oracledb.connect(user=ORACLE_USER, password=ORACLE_PASSWORD, dsn=ORACLE_DSN)
             # Testa se as tabelas existem e são acessíveis
             with self.conn.cursor() as cursor:
-                cursor.execute(f"SELECT 1 FROM {TABLE_A_GEOMETRY} WHERE 1=0")
-                cursor.execute(f"SELECT 1 FROM {TABLE_B_TASKS} WHERE 1=0")
+                cursor.execute(f"SELECT 1 FROM {TABLE_RECORTE} WHERE 1=0")
+                cursor.execute(f"SELECT 1 FROM {TABLE_RECORTE_ANALISE} WHERE 1=0")
         except oracledb.DatabaseError as e:
-            messagebox.showerror("Erro de Banco de Dados", f"Não foi possível conectar ou encontrar as tabelas no Oracle DB: {e}\n\nVerifique as configurações em main.py (TABLE_A_GEOMETRY, TABLE_B_TASKS).")
+            messagebox.showerror("Erro de Banco de Dados", f"Não foi possível conectar ou encontrar as tabelas no Oracle DB: {e}\n\nVerifique as configurações e os nomes das tabelas em main.py.")
             raise
         except Exception as e:
             messagebox.showerror("Erro Crítico na Inicialização", f"Ocorreu um erro inesperado: {e}")
@@ -60,19 +67,17 @@ class TaskManager:
             with self.conn.cursor() as cursor:
                 self.conn.autocommit = False
 
-                # 1. Busca todas as tarefas pendentes fazendo JOIN entre as tabelas
+                # 1. Busca todas as tarefas pendentes da tabela de recortes
                 sql_fetch_pending = f"""
                     SELECT
-                        b.{JOIN_KEY}, b.status, a.FILENAME,
-                        a.BOX_X, a.BOX_Y, a.BOX_W, a.BOX_H
+                        NU_PID, CO_DEDO, FILENAME,
+                        BOX_X, BOX_Y, BOX_W, BOX_H
                     FROM
-                        {TABLE_B_TASKS} b
-                    JOIN
-                        {TABLE_A_GEOMETRY} a ON b.{JOIN_KEY} = a.{JOIN_KEY}
+                        {TABLE_RECORTE}
                     WHERE
-                        b.status = 'PENDENTE'
+                        TP_RECORTE_STATUS = :status_pendente
                 """
-                cursor.execute(sql_fetch_pending)
+                cursor.execute(sql_fetch_pending, status_pendente=STATUS_PENDENTE)
                 
                 db_columns = [desc[0].lower() for desc in cursor.description]
                 pending_df = pd.DataFrame(cursor.fetchall(), columns=db_columns)
@@ -80,17 +85,20 @@ class TaskManager:
                 if pending_df.empty:
                     return None, "Todas as avaliações foram concluídas!"
 
-                # 2. Renomeia colunas para manter a compatibilidade com o resto do código
+                # 2. Renomeia colunas para manter a compatibilidade com a UI
                 rename_map = {
-                    JOIN_KEY.lower(): 'id',
+                    'nu_pid': 'nu_pid',
+                    'co_dedo': 'co_dedo',
                     'filename': 'nome_imagem_digital',
                     'box_x': 'bbox_x1',
                     'box_y': 'bbox_y1',
-                    'box_w': 'bbox_x2',
-                    'box_h': 'bbox_y2'
+                    'box_w': 'bbox_x2', # Mapeado diretamente para bbox_x2
+                    'box_h': 'bbox_y2'  # Mapeado diretamente para bbox_y2
                 }
                 pending_df.rename(columns=rename_map, inplace=True)
-                pending_df.set_index('id', inplace=True)
+                
+                # A chave de uma tarefa agora é composta por (nu_pid, co_dedo)
+                pending_df.set_index(['nu_pid', 'co_dedo'], inplace=True)
 
                 # 3. Agrupa tarefas por "mão" (hand), replicando a lógica original
                 def get_person_hand_id(image_name):
@@ -114,23 +122,30 @@ class TaskManager:
                 # 4. Seleciona o lote de mãos e reserva as tarefas
                 batch_hand_ids = unique_hand_ids[:batch_size]
                 tasks_to_reserve_df = pending_df[pending_df['person_hand_id'].isin(batch_hand_ids)].copy()
-                task_ids_to_reserve = tasks_to_reserve_df.index.tolist()
+                task_ids_to_reserve = tasks_to_reserve_df.index.tolist() # Lista de tuplas (nu_pid, co_dedo)
 
                 if not task_ids_to_reserve:
                     return None, "Nenhuma tarefa encontrada para o lote selecionado."
 
-                # 5. Bloqueia e atualiza as linhas na Tabela B (de tarefas)
-                id_placeholders = ", ".join([f":id{i+1}" for i in range(len(task_ids_to_reserve))])
-                lock_sql = f"SELECT {JOIN_KEY} FROM {TABLE_B_TASKS} WHERE {JOIN_KEY} IN ({id_placeholders}) AND status = 'PENDENTE' FOR UPDATE"
-                cursor.execute(lock_sql, task_ids_to_reserve)
+                # 5. Bloqueia e atualiza as linhas na Tabela de Recorte
+                # A sintaxe de comparação de tuplas pode variar. Esta é comum em Oracle.
+                id_placeholders = ", ".join([f"(:pid{i}, :cid{i})" for i in range(len(task_ids_to_reserve))])
+                lock_sql = f"SELECT NU_PID FROM {TABLE_RECORTE} WHERE (NU_PID, CO_DEDO) IN ({id_placeholders}) AND TP_RECORTE_STATUS = :status_pendente FOR UPDATE"
+                
+                bind_vars = {'status_pendente': STATUS_PENDENTE}
+                for i, (pid, cid) in enumerate(task_ids_to_reserve):
+                    bind_vars[f'pid{i}'] = pid
+                    bind_vars[f'cid{i}'] = cid
+                
+                cursor.execute(lock_sql, bind_vars)
                 
                 locked_rows = cursor.fetchall()
                 if len(locked_rows) != len(task_ids_to_reserve):
                     self.conn.rollback()
                     return None, "Conflito de reserva. Outro operador pode ter pego estas tarefas. Tente novamente."
 
-                update_sql = f"UPDATE {TABLE_B_TASKS} SET status = 'EM_PROCESSAMENTO', operador_id = :op_id WHERE {JOIN_KEY} = :task_id"
-                update_data = [{'op_id': OPERATOR_ID, 'task_id': int(task_id)} for task_id in task_ids_to_reserve]
+                update_sql = f"UPDATE {TABLE_RECORTE} SET TP_RECORTE_STATUS = :status_proc WHERE NU_PID = :pid AND CO_DEDO = :cid"
+                update_data = [{'status_proc': STATUS_EM_PROCESSAMENTO, 'pid': pid, 'cid': cid} for pid, cid in task_ids_to_reserve]
                 cursor.executemany(update_sql, update_data)
                 
                 self.conn.commit()
@@ -139,6 +154,7 @@ class TaskManager:
                 unique_hands = []
                 for hand_id in batch_hand_ids:
                     hand_tasks_df = tasks_to_reserve_df[tasks_to_reserve_df['person_hand_id'] == hand_id]
+                    # O índice agora é um MultiIndex, mas a lógica de agrupar por 'person_hand_id' continua a mesma
                     unique_hands.append({
                         "id": hand_id,
                         "image_name": f"column_{hand_id}.png",
@@ -186,37 +202,57 @@ class TaskManager:
         return processed_image
 
     def update_batch_results(self, evaluated_tasks, unevaluated_tasks):
-        """Atualiza os resultados do lote no banco de dados."""
+        """Atualiza os resultados do lote no banco de dados, inserindo em RECORTE_ANALISE e atualizando status em RECORTE."""
         try:
             with self.conn.cursor() as cursor:
                 self.conn.autocommit = False
                 timestamp = datetime.datetime.now()
 
-                # Tarefas concluídas: Atualiza a Tabela B
+                # 1. Tarefas concluídas: INSERIR em RECORTE_ANALISE e ATUALIZAR em RECORTE
                 if not evaluated_tasks.empty:
-                    update_eval_sql = f"""
-                        UPDATE {TABLE_B_TASKS}
-                        SET fator_1_recorte_correto = :f1,
-                            fator_2_qualidade_suficiente = :f2,
-                            status = 'CONCLUIDO',
-                            timestamp_avaliacao = :ts
-                        WHERE {JOIN_KEY} = :task_id
+                    # Insere os resultados na tabela de análise
+                    insert_sql = f"""
+                        INSERT INTO {TABLE_RECORTE_ANALISE} 
+                        (NU_PID, CO_DEDO, FATOR_1_RECORTE_CORRETO, FATOR_2_QUALIDADE_SUFICIENTE, NU_RICOPER, DT_TRATPEDIDO)
+                        VALUES (:pid, :cid, :f1, :f2, :op_id, :ts)
                     """
-                    eval_data = [
+                    # Converte 'SIM'/'NAO' para 1/0 para os fatores
+                    eval_data_insert = [
                         {
-                            'f1': row['fator_1_recorte_correto'],
-                            'f2': row['fator_2_qualidade_suficiente'],
-                            'ts': timestamp,
-                            'task_id': int(index)
+                            'pid': int(index[0]),
+                            'cid': int(index[1]),
+                            'f1': 1 if row['fator_1_recorte_correto'] == 'SIM' else 0,
+                            'f2': 1 if row['fator_2_qualidade_suficiente'] == 'SIM' else 0,
+                            'op_id': OPERATOR_ID, # Mapeado para NU_RICOPER
+                            'ts': timestamp      # Mapeado para DT_TRATPEDIDO
                         }
                         for index, row in evaluated_tasks.iterrows()
                     ]
-                    cursor.executemany(update_eval_sql, eval_data)
+                    cursor.executemany(insert_sql, eval_data_insert)
 
-                # Tarefas não concluídas (liberar): Atualiza a Tabela B
+                    # Atualiza o status na tabela de recorte para CONCLUIDO
+                    update_sql_recorte = f"UPDATE {TABLE_RECORTE} SET TP_RECORTE_STATUS = :status WHERE NU_PID = :pid AND CO_DEDO = :cid"
+                    eval_data_update = [
+                        {
+                            'status': STATUS_CONCLUIDO,
+                            'pid': int(index[0]),
+                            'cid': int(index[1])
+                        }
+                        for index, row in evaluated_tasks.iterrows()
+                    ]
+                    cursor.executemany(update_sql_recorte, eval_data_update)
+
+                # 2. Tarefas não concluídas (liberar): ATUALIZAR status em RECORTE para PENDENTE
                 if not unevaluated_tasks.empty:
-                    update_uneval_sql = f"UPDATE {TABLE_B_TASKS} SET status = 'PENDENTE', operador_id = NULL WHERE {JOIN_KEY} = :task_id"
-                    uneval_data = [{'task_id': int(index)} for index, row in unevaluated_tasks.iterrows()]
+                    update_uneval_sql = f"UPDATE {TABLE_RECORTE} SET TP_RECORTE_STATUS = :status WHERE NU_PID = :pid AND CO_DEDO = :cid"
+                    uneval_data = [
+                        {
+                            'status': STATUS_PENDENTE,
+                            'pid': int(index[0]),
+                            'cid': int(index[1])
+                        }
+                        for index, row in unevaluated_tasks.iterrows()
+                    ]
                     cursor.executemany(update_uneval_sql, uneval_data)
 
                 self.conn.commit()
