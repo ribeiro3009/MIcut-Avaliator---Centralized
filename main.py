@@ -9,9 +9,23 @@ import socket
 import datetime
 import traceback
 import threading
+import sys
 
-# Inicializa o modo "Thick" do driver Oracle para compatibilidade
-oracledb.init_oracle_client()
+# --- Bloco de Inicialização do Oracle Client ---
+try:
+    if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+        # Rodando como um executável do PyInstaller
+        # O PyInstaller extrai os arquivos para uma pasta temporária e armazena o caminho em sys._MEIPASS
+        lib_dir = os.path.join(sys._MEIPASS, "instantclient_19_27")
+        oracledb.init_oracle_client(lib_dir=lib_dir)
+    else:
+        # Rodando como um script .py normal
+        oracledb.init_oracle_client()
+except oracledb.DatabaseError as e:
+     # Adiciona uma mensagem de erro mais clara na inicialização
+     messagebox.showerror("Erro Crítico de Banco de Dados", 
+                          f"Não foi possível inicializar o Oracle Client. Verifique a instalação.\n\nDetalhe: {e}")
+     sys.exit(1)
 
 # --- CONFIGURAÇÕES GLOBAIS ---
 
