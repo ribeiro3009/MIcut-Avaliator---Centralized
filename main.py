@@ -10,6 +10,9 @@ import datetime
 import traceback
 import threading
 
+# Inicializa o modo "Thick" do driver Oracle para compatibilidade
+oracledb.init_oracle_client()
+
 # --- CONFIGURAÇÕES GLOBAIS ---
 
 # Mantenha esta variável com o caminho para a pasta de imagens.
@@ -33,9 +36,16 @@ STATUS_EM_PROCESSAMENTO = 20
 STATUS_CONCLUIDO = 40
 
 try:
-    OPERATOR_ID = socket.gethostname()
+    hostname = socket.gethostname()
+    # Extrai todos os dígitos do hostname e converte para um número inteiro.
+    # Ex: "rj0310301" se torna 310301
+    numeric_id_str = "".join(filter(str.isdigit, hostname))
+    if numeric_id_str:
+        OPERATOR_ID = int(numeric_id_str)
+    else:
+        OPERATOR_ID = 0 # Um valor padrão caso o hostname não tenha números
 except:
-    OPERATOR_ID = "unknown_operator"
+    OPERATOR_ID = 0 # Um valor padrão em caso de erro
 
 # --- LÓGICA DE NEGÓCIO E DADOS (ORACLE DB) ---
 
@@ -85,17 +95,20 @@ class TaskManager:
                 if pending_df.empty:
                     return None, "Todas as avaliações foram concluídas!"
 
-                # 2. Renomeia colunas para manter a compatibilidade com a UI
+                # 2. Renomeia e calcula colunas para manter a compatibilidade com a UI
                 rename_map = {
                     'nu_pid': 'nu_pid',
                     'co_dedo': 'co_dedo',
                     'filename': 'nome_imagem_digital',
                     'box_x': 'bbox_x1',
                     'box_y': 'bbox_y1',
-                    'box_w': 'bbox_x2', # Mapeado diretamente para bbox_x2
-                    'box_h': 'bbox_y2'  # Mapeado diretamente para bbox_y2
+                    'box_w': 'box_w',
+                    'box_h': 'box_h'
                 }
                 pending_df.rename(columns=rename_map, inplace=True)
+                # Calcula as coordenadas x2, y2 a partir da largura e altura lidas do banco
+                pending_df['bbox_x2'] = pending_df['bbox_x1'] + pending_df['box_w']
+                pending_df['bbox_y2'] = pending_df['bbox_y1'] + pending_df['box_h']
                 
                 # A chave de uma tarefa agora é composta por (nu_pid, co_dedo)
                 pending_df.set_index(['nu_pid', 'co_dedo'], inplace=True)
@@ -211,12 +224,11 @@ class TaskManager:
                 # 1. Tarefas concluídas: INSERIR em RECORTE_ANALISE e ATUALIZAR em RECORTE
                 if not evaluated_tasks.empty:
                     # Insere os resultados na tabela de análise
-                    insert_sql = f"""
-                        INSERT INTO {TABLE_RECORTE_ANALISE} 
-                        (NU_PID, CO_DEDO, FATOR_1_RECORTE_CORRETO, FATOR_2_QUALIDADE_SUFICIENTE, NU_RICOPER, DT_TRATPEDIDO)
+                    sql_analise = f"""
+                        INSERT INTO {TABLE_RECORTE_ANALISE} (NU_PID, CO_DEDO, FATOR_1_RECORTE_CORRETO, FATOR_2_QUALIDADE_SUFICIENTE, NU_RICOPER, DT_TRATPEDIDO)
                         VALUES (:pid, :cid, :f1, :f2, :op_id, :ts)
                     """
-                    # Converte 'SIM'/'NAO' para 1/0 para os fatores
+                    # O driver do oracledb lida com a conversão do objeto datetime do Python diretamente
                     eval_data_insert = [
                         {
                             'pid': int(index[0]),
@@ -228,7 +240,7 @@ class TaskManager:
                         }
                         for index, row in evaluated_tasks.iterrows()
                     ]
-                    cursor.executemany(insert_sql, eval_data_insert)
+                    cursor.executemany(sql_analise, eval_data_insert)
 
                     # Atualiza o status na tabela de recorte para CONCLUIDO
                     update_sql_recorte = f"UPDATE {TABLE_RECORTE} SET TP_RECORTE_STATUS = :status WHERE NU_PID = :pid AND CO_DEDO = :cid"
@@ -433,22 +445,34 @@ class EvaluationScreen(ctk.CTkFrame):
             crop_image_obj = original_img.crop(box)
             self.create_crop_widget(df_index, row, crop_image_obj)
 
-        w, h = display_img.size
-        max_h = 800
-        if h > max_h:
-            ratio = max_h / h
-            new_w = int(w * ratio)
-            display_img = display_img.resize((new_w, max_h), Image.LANCZOS)
+        # Define um tamanho máximo para a área da imagem
+        max_w = 550
+        max_h = 750
+
+        original_w, original_h = display_img.size
+
+        # Apenas redimensiona a imagem se ela for maior que a área máxima permitida
+        if original_w > max_w or original_h > max_h:
+            ratio = min(max_w / original_w, max_h / original_h)
+            new_w = int(original_w * ratio)
+            new_h = int(original_h * ratio)
+            display_img = display_img.resize((new_w, new_h), Image.LANCZOS)
 
         ctk_img = ctk.CTkImage(light_image=display_img, size=display_img.size)
         self.col_image_label.configure(image=ctk_img, text="")
 
     def create_crop_widget(self, df_index, data_row, crop_image: Image.Image):
-        widget_frame = ctk.CTkFrame(self)
+        widget_frame = ctk.CTkFrame(self.crops_frame)
         widget_frame.pack(fill="x", pady=5, padx=5)
         widget_frame.grid_columnconfigure(1, weight=1)
 
-        ctk_crop_img = ctk.CTkImage(light_image=crop_image, size=(100, 100))
+        # Calcula o novo tamanho para o recorte mantendo a proporção para caber em um box 100x100
+        original_w, original_h = crop_image.size
+        ratio = min(100 / original_w, 100 / original_h)
+        new_w = int(original_w * ratio)
+        new_h = int(original_h * ratio)
+
+        ctk_crop_img = ctk.CTkImage(light_image=crop_image, size=(new_w, new_h))
         img_label = ctk.CTkLabel(widget_frame, image=ctk_crop_img, text="")
         img_label.bind("<Button-1>", lambda e, img=crop_image: ZoomWindow(self, img))
         img_label.grid(row=0, column=0, rowspan=3, padx=5, pady=5)
@@ -485,7 +509,7 @@ class EvaluationScreen(ctk.CTkFrame):
             self.current_task_df.loc[index, 'fator_2_qualidade_suficiente'] = row['f2_var'].get()
         
         # Concatena os resultados da mão atual com os resultados gerais do lote
-        self.results = pd.concat([self.results, self.current_task_df.drop(columns=['f1_var', 'f2_var', 'person_hand_id'])])
+        self.results = pd.concat([self.results, self.current_task_df.drop(columns=['f1_var', 'f2_var'])])
 
         if self.current_task_index < len(self.batch_data) - 1:
             self.current_task_index += 1

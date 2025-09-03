@@ -3,6 +3,9 @@ import oracledb
 import re
 from tqdm import tqdm
 
+# Inicializa o modo "Thick" do driver Oracle para compatibilidade
+oracledb.init_oracle_client()
+
 # --- CONFIGURAÇÕES DO BANCO DE DADOS ORACLE ---
 # PREENCHA ESTAS INFORMAÇÕES PARA CONECTAR AO SEU BANCO DE DADOS
 ORACLE_USER = "seu_usuario_aqui"
