@@ -175,26 +175,50 @@ class TaskManager:
         return True
 
 # --- INTERFACE GRÁFICA ---
+
+class LoginScreen(ctk.CTkFrame):
+    def __init__(self, master):
+        super().__init__(master)
+        self.master = master
+
+        ctk.CTkLabel(self, text="Login", font=ctk.CTkFont(size=24, weight="bold")).pack(pady=(20,10))
+        
+        ctk.CTkLabel(self, text="Usuário").pack(pady=(20,5))
+        self.user_entry = ctk.CTkEntry(self, justify="center")
+        self.user_entry.pack(pady=5)
+
+        ctk.CTkLabel(self, text="Senha").pack(pady=(10,5))
+        self.password_entry = ctk.CTkEntry(self, justify="center", show="*")
+        self.password_entry.pack(pady=5)
+
+        ctk.CTkButton(self, text="Login", command=self.login).pack(pady=20, ipady=10)
+
+    def login(self):
+        username = self.user_entry.get()
+        password = self.password_entry.get()
+
+        if username == "admin" and password == "admin":
+            self.master.show_batch_selection_screen()
+        else:
+            messagebox.showerror("Erro de Login", "Usuário ou senha incorretos.")
+
+
 class App(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title("MIcut Avaliator - Centralizado")
-        self.geometry("500x300")
+        self.geometry("500x350") # Ajustado para a tela de login
         self.resizable(False, False)
         self.task_manager = None
         self.current_screen = None
         
-        try:
-            self.task_manager = TaskManager()
-            self.show_batch_selection_screen()
-        except Exception as e:
-            self.show_error_screen(f"Falha na inicialização: {e}")
+        self.show_login_screen() # Mostra a tela de login primeiro
 
     def show_screen(self, screen_class, *args, **kwargs):
         if self.current_screen:
             self.current_screen.destroy()
         
-        geometry = kwargs.pop("geometry", "500x300")
+        geometry = kwargs.pop("geometry", "500x350")
         resizable = kwargs.pop("resizable", False)
         self.geometry(geometry)
         self.resizable(resizable, resizable)
@@ -202,8 +226,17 @@ class App(ctk.CTk):
         self.current_screen = screen_class(self, *args, **kwargs)
         self.current_screen.pack(expand=True, fill="both")
 
+    def show_login_screen(self):
+        self.show_screen(LoginScreen, geometry="500x350", resizable=False)
+
     def show_batch_selection_screen(self):
-        self.show_screen(BatchSelectionScreen, geometry="500x300", resizable=False)
+        # A inicialização do TaskManager é movida para cá
+        try:
+            if not self.task_manager:
+                self.task_manager = TaskManager()
+            self.show_screen(BatchSelectionScreen, geometry="500x300", resizable=False)
+        except Exception as e:
+            self.show_error_screen(f"Falha na inicialização: {e}")
 
     def show_loading_screen(self, batch_size):
         self.show_screen(LoadingScreen, batch_size=batch_size, geometry="500x200", resizable=False)
