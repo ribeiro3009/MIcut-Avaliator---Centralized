@@ -21,7 +21,7 @@ try:
         lib_dir = os.path.join(sys._MEIPASS, "instantclient_19_27")
         oracledb.init_oracle_client(lib_dir=lib_dir)
     else:
-        oracledb.init_oracle_client()
+        oracledb.init_oracle_client(lib_dir=r"C:\Oracle\instantclient_21_18")
 except oracledb.DatabaseError as e:
      messagebox.showerror("Erro Crítico de Banco de Dados", 
                           f"Não foi possível inicializar o Oracle Client. Verifique a instalação.\n\nDetalhe: {e}")
@@ -30,7 +30,13 @@ except oracledb.DatabaseError as e:
 # --- CONFIGURAÇÕES GLOBAIS ---
 
 IMAGE_FOLDER_PATH = r".\Fingerprints_Colums"
-ORACLE_DSN = "host:porta/service_name"  # Ex: "detran" ou "192.168.1.50:1521/ORCL"
+ORACLE_DSN = (
+    "(DESCRIPTION=(ADDRESS_LIST= (LOAD_BALANCE=on)"
+    "(ADDRESS=(PROTOCOL=tcp)(HOST=10.200.96.225)(PORT=1521))"
+    "(ADDRESS=(PROTOCOL=tcp)(HOST=10.200.96.226)(PORT=1521))"
+    "(ADDRESS=(PROTOCOL=tcp)(HOST=10.200.96.227)(PORT=1521)))"
+    "(CONNECT_DATA=(SERVICE_NAME= dic)(SERVER = DEDICATED)))"
+)  # Ex: "detran" ou "192.168.1.50:1521/ORCL"
 
 # Nomes das tabelas
 TABLE_RECORTE = "FRC.RECORTE"
