@@ -244,7 +244,7 @@ class App(ctk.CTk):
         except Exception as e:
             messagebox.showerror("Erro de Login", f"Não foi possível conectar ao banco de dados. Verifique suas credenciais e a conexão.\n\nDetalhe: {e}")
 
-    def show_batch_selection_screen():
+    def show_batch_selection_screen(self):
         self.show_screen(BatchSelectionScreen, operator_name=self.operator_full_name, geometry="500x300", resizable=False)
 
     def show_loading_screen(self, batch_size):
