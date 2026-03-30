@@ -27,7 +27,7 @@ try:
         oracledb.init_oracle_client(lib_dir=lib_dir)
     else:
         # Rodando como um script .py normal
-        oracledb.init_oracle_client()
+        oracledb.init_oracle_client(lib_dir=ORACLE_CLIENT_LIB_DIR)
 except oracledb.DatabaseError as e:
     messagebox.showerror("Erro Crítico de Banco de Dados",
                          f"Não foi possível inicializar o Oracle Client. Verifique a instalação e a arquitetura (32/64 bits).\n\nDetalhe: {e}")
@@ -77,7 +77,7 @@ def encrypt_password(password: str) -> tuple[str | None, str | None]:
 
 # --- CONFIGURAÇÕES GLOBAIS ---
 IMAGE_FOLDER_PATH = r"\\imagens\Imagens\FRC_RECORTE"
-ORACLE_DSN = "host:porta/service_name"
+ORACLE_DSN = ORACLE_DSN
 # Nomes das tabelas
 TABLE_RECORTE = "FRC.RECORTE"
 TABLE_RECORTE_ANALISE = "FRC.RECORTE_ANALISE"
@@ -620,9 +620,9 @@ class EvaluationScreen(ctk.CTkFrame):
 
         self.progress_label.configure(text=f"Avaliando Mão {self.current_task_index + 1} de {len(self.batch_data)}")
         if self.current_task_index == len(self.batch_data) - 1:
-            self.next_button.configure(text="Finalizar e Salvar Tudo", fg_color="green")
+            self.next_button.configure(text="Finalizar e Salvar Tud  ", fg_color="green")
         else:
-            self.next_button.configure(text="Salvar Mão e Próxima", fg_color=ctk.ThemeManager.theme["CTkButton"]["fg_color"])
+            self.next_button.configure(text="Salvar", fg_color=ctk.ThemeManager.theme["CTkButton"]["fg_color"])
 
         original_img = self.processed_image.get(current_hand["id"])
         if original_img is None:
@@ -660,10 +660,10 @@ class EvaluationScreen(ctk.CTkFrame):
 
         rotated_crop = crop_image.rotate(90, expand=True)
         original_w, original_h = rotated_crop.size
-        max_w = 300
-        max_h = 260
+        max_w = 360
+        max_h = 320
         ratio = min(max_w / max(1, original_w), max_h / max(1, original_h))
-        ratio = min(ratio, 1.0)
+        ratio = min(ratio, 1.25)
         new_w = max(1, int(original_w * ratio))
         new_h = max(1, int(original_h * ratio))
         displayed_crop = rotated_crop.resize((new_w, new_h), Image.LANCZOS)
@@ -936,7 +936,20 @@ class ZoomWindow(ctk.CTkToplevel):
         self.canvas.bind("<ButtonPress-1>", self.on_button_press)
         self.canvas.bind("<B1-Motion>", self.on_move)
 
+        self.update_idletasks()  # Garante que o canvas tenha as dimensões corretas
+        self._set_initial_zoom()
         self.redraw()
+
+    def _set_initial_zoom(self):
+        canvas_w = max(1, self.canvas.winfo_width())
+        canvas_h = max(1, self.canvas.winfo_height())
+        img_w, img_h = self.original_image.size
+
+        fit_scale = min(canvas_w / img_w, canvas_h / img_h)
+
+        self.scale = min(fit_scale * 1.35, 4.0)
+
+        self.position = [canvas_w / 2, canvas_h / 2]
 
     def redraw(self):
         if self.scale < 0.1: self.scale = 0.1
