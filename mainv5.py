@@ -78,11 +78,7 @@ def encrypt_password(password: str) -> tuple[str | None, str | None]:
 # --- CONFIGURAÇÕES GLOBAIS ---
 IMAGE_FOLDER_PATH = r"\\imagens\Imagens\FRC_RECORTE"
 ORACLE_DSN = (
-    "(DESCRIPTION=(ADDRESS_LIST= (LOAD_BALANCE=on)"
-    "(ADDRESS=(PROTOCOL=tcp)(HOST=10.200.96.225)(PORT=1521))"
-    "(ADDRESS=(PROTOCOL=tcp)(HOST=10.200.96.226)(PORT=1521))"
-    "(ADDRESS=(PROTOCOL=tcp)(HOST=10.200.96.227)(PORT=1521)))"
-    "(CONNECT_DATA=(SERVICE_NAME= dic)(SERVER = DEDICATED)))"
+
 )
 # Nomes das tabelas
 TABLE_RECORTE = "FRC.RECORTE"
