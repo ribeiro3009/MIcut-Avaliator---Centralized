@@ -27,7 +27,7 @@ try:
         oracledb.init_oracle_client(lib_dir=lib_dir)
     else:
         # Rodando como um script .py normal
-        oracledb.init_oracle_client(lib_dir=r"C:\Oracle\instantclient_12.2.0.1.0_x86")
+        oracledb.init_oracle_client()
 except oracledb.DatabaseError as e:
     messagebox.showerror("Erro Crítico de Banco de Dados",
                          f"Não foi possível inicializar o Oracle Client. Verifique a instalação e a arquitetura (32/64 bits).\n\nDetalhe: {e}")
@@ -77,9 +77,7 @@ def encrypt_password(password: str) -> tuple[str | None, str | None]:
 
 # --- CONFIGURAÇÕES GLOBAIS ---
 IMAGE_FOLDER_PATH = r"\\imagens\Imagens\FRC_RECORTE"
-ORACLE_DSN = (
-
-)
+ORACLE_DSN = "host:porta/service_name"
 # Nomes das tabelas
 TABLE_RECORTE = "FRC.RECORTE"
 TABLE_RECORTE_ANALISE = "FRC.RECORTE_ANALISE"
@@ -288,7 +286,7 @@ class TaskManager:
                             'pid': int(index[0]),
                             'cid': int(index[1]),
                             'f1': 1 if row['fator_1_recorte_correto'] == 'SIM' else 0,
-                            'f2': float(row['fator_2_qualidade_suficiente']) -1 ,
+                            'f2': int(row['fator_2_qualidade_suficiente']) - 1,
                             'op_id': op_id_value, # Mapeado para NU_RICOPER
                             'ts': timestamp      # Mapeado para DT_TRATPEDIDO
                         }
@@ -519,47 +517,112 @@ class EvaluationScreen(ctk.CTkFrame):
         self.current_task_index = 0
         # O DataFrame de resultados usará o ID da tarefa (do DB) como índice
         self.results = pd.DataFrame()
+        self.middle_column_visible = False
+        self.finger_widgets = {}
+        self.finger_order = []
+        self.active_finger_pos = 0
+        self._key_binds = []
+        self.ctk_col_img = None
 
         self.setup_ui()
+        self.bind_shortcuts()
         self.load_current_task()
 
     def setup_ui(self):
-        self.grid_columnconfigure(1, weight=1)
-        self.grid_columnconfigure(2, weight=1)
+        self.grid_columnconfigure(1, weight=0)
+        self.grid_columnconfigure(2, weight=3)
         self.grid_rowconfigure(0, weight=1)
 
         actions_frame = ctk.CTkFrame(self, width=200)
         actions_frame.grid(row=0, column=0, sticky="nswe", padx=10, pady=10)
         actions_frame.grid_propagate(False)
-        
+
         self.progress_label = ctk.CTkLabel(actions_frame, text="", font=ctk.CTkFont(size=14, weight="bold"))
         self.progress_label.pack(pady=10, padx=10)
 
+        self.finger_progress_label = ctk.CTkLabel(actions_frame, text="", font=ctk.CTkFont(size=13))
+        self.finger_progress_label.pack(pady=(0, 10), padx=10)
+
+        self.toggle_col_button = ctk.CTkButton(
+            actions_frame,
+            text="Mostrar Coluna Inteira",
+            command=self.toggle_middle_column,
+        )
+        self.toggle_col_button.pack(side="bottom", pady=10, padx=20, fill="x")
+
         self.next_button = ctk.CTkButton(actions_frame, text="Salvar", command=self.next_task)
         self.next_button.pack(side="bottom", pady=10, padx=20, fill="x", ipady=10)
-        
+
         self.save_exit_button = ctk.CTkButton(actions_frame, text="Sair", command=self.on_closing)
         self.save_exit_button.pack(side="bottom", pady=10, padx=20, fill="x")
 
-        col_frame = ctk.CTkFrame(self)
-        col_frame.grid(row=0, column=1, sticky="nswe", padx=(0, 10), pady=10)
-        self.col_image_label = ctk.CTkLabel(col_frame, text="")
+        self.col_frame = ctk.CTkFrame(self)
+        self.col_frame.grid(row=0, column=1, sticky="nswe", padx=(0, 10), pady=10)
+        self.col_image_label = ctk.CTkLabel(self.col_frame, text="")
         self.col_image_label.pack(expand=True, fill="both", padx=5, pady=5)
+        self.col_frame.grid_remove()
 
         self.crops_frame = ctk.CTkScrollableFrame(self, label_text="Recortes para Avaliação")
         self.crops_frame.grid(row=0, column=2, sticky="nswe", padx=(0, 10), pady=10)
+
+    def bind_shortcuts(self):
+        bindings = {
+            "<Right>": self.on_next_key,
+            "<Return>": self.on_next_key,
+            "<Left>": self.on_prev_key,
+            "<s>": lambda e: self.set_current_f1("SIM"),
+            "<S>": lambda e: self.set_current_f1("SIM"),
+            "<n>": lambda e: self.set_current_f1("NAO"),
+            "<N>": lambda e: self.set_current_f1("NAO"),
+            "<Key-1>": lambda e: self.set_current_quality(1),
+            "<Key-2>": lambda e: self.set_current_quality(2),
+            "<Key-3>": lambda e: self.set_current_quality(3),
+            "<Key-4>": lambda e: self.set_current_quality(4),
+            "<Key-5>": lambda e: self.set_current_quality(5),
+        }
+        for sequence, callback in bindings.items():
+            self.master.bind(sequence, callback)
+            self._key_binds.append(sequence)
+
+    def destroy(self):
+        for sequence in self._key_binds:
+            self.master.unbind(sequence)
+        super().destroy()
+
+    def toggle_middle_column(self):
+        self.middle_column_visible = not self.middle_column_visible
+        if self.middle_column_visible:
+            self.col_frame.grid()
+            self.grid_columnconfigure(1, weight=1)
+            self.grid_columnconfigure(2, weight=2)
+            self.toggle_col_button.configure(text="Ocultar Coluna Inteira")
+        else:
+            self.col_frame.grid_remove()
+            self.grid_columnconfigure(1, weight=0)
+            self.grid_columnconfigure(2, weight=3)
+            self.toggle_col_button.configure(text="Mostrar Coluna Inteira")
 
     def load_current_task(self):
         for widget in self.crops_frame.winfo_children():
             widget.destroy()
 
         current_hand = self.batch_data[self.current_task_index]
-        # O .copy() é importante para evitar SettingWithCopyWarning
-        self.current_task_df = current_hand["tasks"].copy()
-        
+        self.current_task_df = current_hand["tasks"].copy().sort_index(level='co_dedo')
+        self.finger_widgets = {}
+        self.finger_order = list(self.current_task_df.index)
+        self.active_finger_pos = 0
+
+        self.cards_row_frame = ctk.CTkFrame(self.crops_frame, fg_color="transparent")
+        self.cards_row_frame.pack(fill="both", expand=True, padx=5, pady=5)
+        total_fingers = max(1, len(self.current_task_df))
+        for col in range(total_fingers):
+            self.cards_row_frame.grid_columnconfigure(col, weight=1, uniform="finger_col")
+
         self.progress_label.configure(text=f"Avaliando Mão {self.current_task_index + 1} de {len(self.batch_data)}")
         if self.current_task_index == len(self.batch_data) - 1:
             self.next_button.configure(text="Finalizar e Salvar Tudo", fg_color="green")
+        else:
+            self.next_button.configure(text="Salvar Mão e Próxima", fg_color=ctk.ThemeManager.theme["CTkButton"]["fg_color"])
 
         original_img = self.processed_image.get(current_hand["id"])
         if original_img is None:
@@ -568,85 +631,218 @@ class EvaluationScreen(ctk.CTkFrame):
 
         display_img = original_img.copy()
         draw = ImageDraw.Draw(display_img, "RGBA")
-        
-        # O índice do DataFrame (df_index) agora é o ID da tarefa no banco de dados
-        for df_index, row in self.current_task_df.iterrows():
+
+        for position, (df_index, row) in enumerate(self.current_task_df.iterrows()):
             box = (int(row['bbox_x1']), int(row['bbox_y1']), int(row['bbox_x2']), int(row['bbox_y2']))
             draw.rectangle(box, outline="red", width=3)
             crop_image_obj = original_img.crop(box)
-            self.create_crop_widget(df_index, row, crop_image_obj)
+            self.create_crop_widget(df_index, row, crop_image_obj, position)
 
-        # Define um tamanho máximo para a área da imagem
         max_w = 550
         max_h = 750
-
         original_w, original_h = display_img.size
-
-        # Apenas redimensiona a imagem se ela for maior que a área máxima permitida
         if original_w > max_w or original_h > max_h:
             ratio = min(max_w / original_w, max_h / original_h)
             new_w = int(original_w * ratio)
             new_h = int(original_h * ratio)
             display_img = display_img.resize((new_w, new_h), Image.LANCZOS)
 
-        ctk_img = ctk.CTkImage(light_image=display_img, size=display_img.size)
-        self.col_image_label.configure(image=ctk_img, text="")
+        self.ctk_col_img = ctk.CTkImage(light_image=display_img, size=display_img.size)
+        self.col_image_label.configure(image=self.ctk_col_img, text="")
 
-    def create_crop_widget(self, df_index, data_row, crop_image: Image.Image):
-        widget_frame = ctk.CTkFrame(self.crops_frame)
-        widget_frame.pack(fill="x", pady=5, padx=5)
-        widget_frame.grid_columnconfigure(1, weight=1)
+        self.focus_set()
+        self.set_active_finger(self.first_incomplete_finger_pos())
 
-        # Calcula o novo tamanho para o recorte mantendo a proporção para caber em um box 100x100
-        original_w, original_h = crop_image.size
-        ratio = min(100 / original_w, 100 / original_h)
-        new_w = int(original_w * ratio)
-        new_h = int(original_h * ratio)
+    def create_crop_widget(self, df_index, data_row, crop_image: Image.Image, position):
+        widget_frame = ctk.CTkFrame(self.cards_row_frame, border_width=0)
+        widget_frame.grid(row=0, column=position, sticky="nsew", padx=5, pady=5)
+        widget_frame.grid_columnconfigure(0, weight=1)
 
-        ctk_crop_img = ctk.CTkImage(light_image=crop_image, size=(new_w, new_h))
+        rotated_crop = crop_image.rotate(90, expand=True)
+        original_w, original_h = rotated_crop.size
+        max_w = 300
+        max_h = 260
+        ratio = min(max_w / max(1, original_w), max_h / max(1, original_h))
+        ratio = min(ratio, 1.0)
+        new_w = max(1, int(original_w * ratio))
+        new_h = max(1, int(original_h * ratio))
+        displayed_crop = rotated_crop.resize((new_w, new_h), Image.LANCZOS)
+
+        ctk_crop_img = ctk.CTkImage(light_image=displayed_crop, size=(new_w, new_h))
         img_label = ctk.CTkLabel(widget_frame, image=ctk_crop_img, text="")
-        img_label.bind("<Button-1>", lambda e, img=crop_image: ZoomWindow(self, img))
-        img_label.grid(row=0, column=0, rowspan=3, padx=5, pady=5)
+        img_label.bind("<Button-1>", lambda e, img=rotated_crop: ZoomWindow(self, img))
+        img_label.grid(row=0, column=0, padx=8, pady=(8, 6), sticky="w")
+        img_label._ctk_img_ref = ctk_crop_img
 
-        ctk.CTkLabel(widget_frame, text=data_row['nome_imagem_digital'], font=ctk.CTkFont(weight="bold")).grid(row=0, column=1, sticky="w", padx=5)
+        ctk.CTkLabel(
+            widget_frame,
+            text=data_row['nome_imagem_digital'],
+            font=ctk.CTkFont(weight="bold")
+        ).grid(row=1, column=0, sticky="w", padx=8)
 
+        quality_var = ctk.IntVar(value=0)
         f1_var = ctk.StringVar(value=str(data_row.get('fator_1_recorte_correto', '')))
-        f2_var = ctk.DoubleVar(value=0.0) # 0.0 significa não avaliado
+
+        quality_frame = ctk.CTkFrame(widget_frame, fg_color="transparent")
+        quality_frame.grid(row=2, column=0, sticky="ew", padx=8, pady=(4, 2))
+        quality_frame.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(quality_frame, text="Qualidade:").grid(row=0, column=0, sticky="w")
+
+        quality_buttons_frame = ctk.CTkFrame(quality_frame, fg_color="transparent")
+        quality_buttons_frame.grid(row=1, column=0, sticky="w", pady=(2, 0))
+
+        quality_buttons = {}
+        for idx, label in enumerate(["?", "1", "2", "3", "4", "5"]):
+            value = 0 if label == "?" else int(label)
+            btn = ctk.CTkRadioButton(
+                quality_buttons_frame,
+                text=label,
+                variable=quality_var,
+                value=value,
+                width=38,
+                command=lambda i=df_index: self.set_active_by_index(i),
+            )
+            btn.grid(row=0, column=idx, padx=(0, 6), sticky="w")
+            quality_buttons[value] = btn
 
         f1_frame = ctk.CTkFrame(widget_frame, fg_color="transparent")
-        f1_frame.grid(row=1, column=1, sticky="ew", padx=5)
+        f1_frame.grid(row=3, column=0, sticky="ew", padx=8, pady=(2, 8))
         ctk.CTkLabel(f1_frame, text="Recorte correto?").pack(side="left")
-        ctk.CTkRadioButton(f1_frame, text="Não", variable=f1_var, value="NAO").pack(side="right")
-        ctk.CTkRadioButton(f1_frame, text="Sim", variable=f1_var, value="SIM").pack(side="right", padx=5)
-        
-        f2_frame = ctk.CTkFrame(widget_frame, fg_color="transparent")
-        f2_frame.grid(row=2, column=1, sticky="ew", padx=5)
-        ctk.CTkLabel(f2_frame, text="Qualidade (1-10):").pack(side="left")
-        
-        slider_value_label = ctk.CTkLabel(f2_frame, text="N/A", width=25)
-        slider_value_label.pack(side="right", padx=(5,0))
 
-        def slider_command(value):
-            slider_value_label.configure(text=f"{value:.0f}")
+        no_btn = ctk.CTkRadioButton(
+            f1_frame,
+            text="Não",
+            variable=f1_var,
+            value="NAO",
+            command=lambda i=df_index: self.set_active_by_index(i),
+        )
+        no_btn.pack(side="right")
 
-        slider = ctk.CTkSlider(f2_frame, from_=1, to=10, number_of_steps=9, variable=f2_var, command=slider_command)
-        slider.pack(side="right", fill="x", expand=True, padx=5)
+        yes_btn = ctk.CTkRadioButton(
+            f1_frame,
+            text="Sim",
+            variable=f1_var,
+            value="SIM",
+            command=lambda i=df_index: self.set_active_by_index(i),
+        )
+        yes_btn.pack(side="right", padx=8)
 
-        # Armazena as variáveis tkinter para obter os valores mais tarde
         self.current_task_df.loc[df_index, 'f1_var'] = f1_var
-        self.current_task_df.loc[df_index, 'f2_var'] = f2_var
+        self.current_task_df.loc[df_index, 'f2_var'] = quality_var
+        self.finger_widgets[df_index] = {
+            'frame': widget_frame,
+            'quality_var': quality_var,
+            'f1_var': f1_var,
+            'quality_buttons': quality_buttons,
+            'yes_btn': yes_btn,
+            'no_btn': no_btn,
+        }
+
+    def first_incomplete_finger_pos(self):
+        for pos, idx in enumerate(self.finger_order):
+            row = self.current_task_df.loc[idx]
+            if not row['f1_var'].get() or row['f2_var'].get() == 0:
+                return pos
+        return 0
+
+    def set_active_by_index(self, df_index):
+        if df_index in self.finger_order:
+            self.set_active_finger(self.finger_order.index(df_index))
+
+    def set_active_finger(self, pos):
+        if not self.finger_order:
+            self.finger_progress_label.configure(text="")
+            return
+
+        pos = max(0, min(pos, len(self.finger_order) - 1))
+        self.active_finger_pos = pos
+        active_index = self.finger_order[pos]
+
+        for idx, data in self.finger_widgets.items():
+            if idx == active_index:
+                data['frame'].configure(border_width=2, border_color="#2FA572")
+            else:
+                data['frame'].configure(border_width=0)
+
+        self.finger_progress_label.configure(text=f"Dedo {self.active_finger_pos + 1} de {len(self.finger_order)}")
+        self.scroll_active_into_view()
+
+    def scroll_active_into_view(self):
+        if not self.finger_order or not hasattr(self.crops_frame, "_parent_canvas"):
+            return
+
+        active_index = self.finger_order[self.active_finger_pos]
+        frame = self.finger_widgets[active_index]['frame']
+        canvas = self.crops_frame._parent_canvas
+
+        self.update_idletasks()
+        frame_y = frame.winfo_y()
+        content_h = self.crops_frame.winfo_height()
+        canvas_h = canvas.winfo_height()
+        scroll_max = max(1, content_h - canvas_h)
+        canvas.yview_moveto(max(0.0, min(1.0, frame_y / scroll_max)))
+
+    def current_finger_index(self):
+        if not self.finger_order:
+            return None
+        return self.finger_order[self.active_finger_pos]
+
+    def set_current_quality(self, value):
+        current_idx = self.current_finger_index()
+        if current_idx is None:
+            return "break"
+        self.current_task_df.loc[current_idx, 'f2_var'].set(value)
+        self.set_active_by_index(current_idx)
+        return "break"
+
+    def set_current_f1(self, value):
+        current_idx = self.current_finger_index()
+        if current_idx is None:
+            return "break"
+        self.current_task_df.loc[current_idx, 'f1_var'].set(value)
+        self.set_active_by_index(current_idx)
+        return "break"
+
+    def validate_finger(self, df_index, show_message=True):
+        row = self.current_task_df.loc[df_index]
+        if not row['f1_var'].get() or row['f2_var'].get() == 0:
+            if show_message:
+                messagebox.showwarning("Atenção", "Defina Sim/Não e a nota de 1 a 5 do dedo ativo antes de avançar.")
+            return False
+        return True
+
+    def on_next_key(self, event=None):
+        if not self.finger_order:
+            return "break"
+
+        current_idx = self.current_finger_index()
+        if current_idx is None:
+            return "break"
+
+        if not self.validate_finger(current_idx, show_message=True):
+            return "break"
+
+        if self.active_finger_pos < len(self.finger_order) - 1:
+            self.set_active_finger(self.active_finger_pos + 1)
+        else:
+            self.next_task()
+        return "break"
+
+    def on_prev_key(self, event=None):
+        if self.active_finger_pos > 0:
+            self.set_active_finger(self.active_finger_pos - 1)
+        return "break"
 
     def next_task(self):
         for index, row in self.current_task_df.iterrows():
-            if not row['f1_var'].get() or row['f2_var'].get() == 0.0:
-                messagebox.showwarning("Atenção", "Por favor, avalie todos os recortes (Qualidade não pode ser N/A).")
+            if not row['f1_var'].get() or row['f2_var'].get() == 0:
+                messagebox.showwarning("Atenção", "Por favor, avalie todos os dedos (Sim/Não e qualidade 1 a 5).")
                 return
-        
+
         for index, row in self.current_task_df.iterrows():
             self.current_task_df.loc[index, 'fator_1_recorte_correto'] = row['f1_var'].get()
             self.current_task_df.loc[index, 'fator_2_qualidade_suficiente'] = row['f2_var'].get()
-        
-        # Concatena os resultados da mão atual com os resultados gerais do lote
+
         self.results = pd.concat([self.results, self.current_task_df.drop(columns=['f1_var', 'f2_var'])])
 
         if self.current_task_index < len(self.batch_data) - 1:
