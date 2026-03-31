@@ -579,6 +579,8 @@ class EvaluationScreen(ctk.CTkFrame):
             "<Key-3>": lambda e: self.set_current_quality(3),
             "<Key-4>": lambda e: self.set_current_quality(4),
             "<Key-5>": lambda e: self.set_current_quality(5),
+            "<o>": lambda e: self.on_toggle_column_key(),
+            "<O>": lambda e: self.on_toggle_column_key(),
         }
         for sequence, callback in bindings.items():
             self.master.bind(sequence, callback)
@@ -588,6 +590,10 @@ class EvaluationScreen(ctk.CTkFrame):
         for sequence in self._key_binds:
             self.master.unbind(sequence)
         super().destroy()
+
+    def on_toggle_column_key(self):
+        self.toggle_middle_column()
+        return "break"
 
     def toggle_middle_column(self):
         self.middle_column_visible = not self.middle_column_visible
@@ -936,7 +942,7 @@ class ZoomWindow(ctk.CTkToplevel):
         self.canvas.bind("<ButtonPress-1>", self.on_button_press)
         self.canvas.bind("<B1-Motion>", self.on_move)
 
-        self.update_idletasks()  # Garante que o canvas tenha as dimensões corretas
+        self.update_idletasks()  
         self._set_initial_zoom()
         self.redraw()
 
