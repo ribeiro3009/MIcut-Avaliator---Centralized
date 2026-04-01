@@ -286,7 +286,7 @@ class TaskManager:
                             'pid': int(index[0]),
                             'cid': int(index[1]),
                             'f1': 1 if row['fator_1_recorte_correto'] == 'SIM' else 0,
-                            'f2': int(row['fator_2_qualidade_suficiente']) - 1,
+                            'f2': int(row['fator_2_qualidade_suficiente']),
                             'op_id': op_id_value, # Mapeado para NU_RICOPER
                             'ts': timestamp      # Mapeado para DT_TRATPEDIDO
                         }
@@ -386,7 +386,7 @@ class App(ctk.CTk):
         self.show_screen(LoadingScreen, batch_size=batch_size, geometry="500x200", resizable=False)
 
     def show_evaluation_screen(self, batch_data, processed_image):
-        self.show_screen(EvaluationScreen, batch_data=batch_data, processed_image=processed_image, user_id=self.logged_user_id, geometry="1200x800", resizable=True)
+        self.show_screen(EvaluationScreen, batch_data=batch_data, processed_image=processed_image, user_id=self.logged_user_id, geometry="1500x900", resizable=True)
         self.protocol("WM_DELETE_WINDOW", self.current_screen.on_closing)
 
     def show_error_screen(self, message):
@@ -523,6 +523,11 @@ class EvaluationScreen(ctk.CTkFrame):
         self._key_binds = []
         self.ctk_col_img = None
         self.current_original_img = None
+        self.current_rotated_img = None
+        self.rotated_boxes = {}
+        self.render_scale = 1.0
+        self.render_offset_x = 0
+        self.render_offset_y = 0
 
         self.setup_ui()
         self.bind_shortcuts()
@@ -535,7 +540,7 @@ class EvaluationScreen(ctk.CTkFrame):
         self.grid_rowconfigure(0, weight=1)
 
         # Left panel: Actions
-        actions_frame = ctk.CTkFrame(self, width=200)
+        actions_frame = ctk.CTkFrame(self, width=170)
         actions_frame.grid(row=0, column=0, sticky="nswe", padx=10, pady=10)
         actions_frame.grid_propagate(False)
 
@@ -553,14 +558,15 @@ class EvaluationScreen(ctk.CTkFrame):
 
         # Right panel: Image (top) + Controls (bottom)
         self.right_panel = ctk.CTkFrame(self)
-        self.right_panel.grid(row=0, column=1, sticky="nswe", padx=(0, 10), pady=10)
+        self.right_panel.grid(row=0, column=1, sticky="nswe", padx=(0, 6), pady=8)
         self.right_panel.grid_columnconfigure(0, weight=1)
-        self.right_panel.grid_rowconfigure(0, weight=5)  # Image row - more space
+        self.right_panel.grid_rowconfigure(0, weight=7)  # Image row - more space
         self.right_panel.grid_rowconfigure(1, weight=1)  # Controls row - less space
 
         # Top row: Image frame
         self.image_frame = ctk.CTkFrame(self.right_panel)
         self.image_frame.grid(row=0, column=0, sticky="nswe", padx=5, pady=5)
+        self.image_frame.bind("<Configure>", self.on_image_area_resize)
         self.col_image_label = ctk.CTkLabel(self.image_frame, text="")
         self.col_image_label.pack(expand=True, fill="both", padx=5, pady=5)
         self.col_image_label.bind("<Button-1>", self.on_image_click)
@@ -584,6 +590,7 @@ class EvaluationScreen(ctk.CTkFrame):
             "<Key-3>": lambda e: self.set_current_quality(3),
             "<Key-4>": lambda e: self.set_current_quality(4),
             "<Key-5>": lambda e: self.set_current_quality(5),
+            "<Key-0>": lambda e: self.set_current_quality(0),
         }
         for sequence, callback in bindings.items():
             self.master.bind(sequence, callback)
@@ -622,43 +629,67 @@ class EvaluationScreen(ctk.CTkFrame):
             self.col_image_label.configure(text=f"Imagem para\n{current_hand['id']}\nnão foi carregada.", image=None)
             return
 
-        # Store original image for later use
+        # Store original image and build rotated image/boxes cache for rendering.
         self.current_original_img = original_img
+        self.current_rotated_img = original_img.rotate(90, expand=True)
+        self.rotated_boxes = {}
+        original_width = original_img.size[0]
+
+        for df_index, row in self.current_task_df.iterrows():
+            rx1, ry1, rx2, ry2 = self.rotate_bbox_90_ccw(
+                int(row['bbox_x1']),
+                int(row['bbox_y1']),
+                int(row['bbox_x2']),
+                int(row['bbox_y2']),
+                original_width,
+            )
+            self.rotated_boxes[df_index] = (
+                min(rx1, rx2),
+                min(ry1, ry2),
+                max(rx1, rx2),
+                max(ry1, ry2),
+            )
+
         self.focus_set()
         self.set_active_finger(self.first_incomplete_finger_pos())
 
     def redraw_image_highlight(self):
         """Redraw the full hand image with all boxes in red, and highlight active finger box in green."""
-        if not hasattr(self, 'current_original_img') or self.current_original_img is None:
+        if self.current_rotated_img is None:
             return
 
-        display_img = self.current_original_img.copy()
+        display_img = self.current_rotated_img.copy()
         draw = ImageDraw.Draw(display_img, "RGBA")
         active_index = self.finger_order[self.active_finger_pos] if self.finger_order else None
 
-        # Draw all boxes
-        for df_index, row in self.current_task_df.iterrows():
-            box = (int(row['bbox_x1']), int(row['bbox_y1']), int(row['bbox_x2']), int(row['bbox_y2']))
-            # Active finger in green, others in red
+        # Draw all transformed boxes in rotated image coordinates.
+        for df_index, box in self.rotated_boxes.items():
             color = "green" if df_index == active_index else "red"
             width = 5 if df_index == active_index else 3
             draw.rectangle(box, outline=color, width=width)
 
-        # Scale image if needed
-        max_w = 550
-        max_h = 650
-        original_w, original_h = display_img.size
-        if original_w > max_w or original_h > max_h:
-            ratio = min(max_w / original_w, max_h / original_h)
-            new_w = int(original_w * ratio)
-            new_h = int(original_h * ratio)
-            display_img = display_img.resize((new_w, new_h), Image.LANCZOS)
+        # Render responsively to occupy most of image area while preserving aspect ratio.
+        self.update_idletasks()
+        area_w = max(1, self.col_image_label.winfo_width() - 10)
+        area_h = max(1, self.col_image_label.winfo_height() - 10)
+
+        src_w, src_h = display_img.size
+        ratio = min(area_w / src_w, area_h / src_h)
+        ratio = max(0.1, min(ratio, 2.5))
+
+        new_w = max(1, int(src_w * ratio))
+        new_h = max(1, int(src_h * ratio))
+        display_img = display_img.resize((new_w, new_h), Image.LANCZOS)
+
+        self.render_scale = ratio
+        self.render_offset_x = (self.col_image_label.winfo_width() - new_w) / 2
+        self.render_offset_y = (self.col_image_label.winfo_height() - new_h) / 2
 
         self.ctk_col_img = ctk.CTkImage(light_image=display_img, size=display_img.size)
         self.col_image_label.configure(image=self.ctk_col_img, text="")
 
     def rotate_bbox_90_ccw(self, x1, y1, x2, y2, orig_w):
-    # PIL rotate(90) -> anti-horario
+        # PIL rotate(90) => anti-horario (CCW).
         nx1 = y1
         ny1 = orig_w - x2
         nx2 = y2
@@ -677,7 +708,6 @@ class EvaluationScreen(ctk.CTkFrame):
         finger_data = self.finger_widgets[df_index]
         quality_var = finger_data['quality_var']
         f1_var = finger_data['f1_var']
-        row_data = self.current_task_df.loc[df_index]
 
         # Quality buttons frame
         quality_frame = ctk.CTkFrame(self.controls_frame, fg_color="transparent")
@@ -714,7 +744,7 @@ class EvaluationScreen(ctk.CTkFrame):
             value="NAO",
             command=lambda i=df_index: self.set_active_by_index(i),
         )
-        no_btn.pack(side="right")
+        no_btn.pack(side="left", padx=8)
 
         yes_btn = ctk.CTkRadioButton(
             f1_frame,
@@ -723,7 +753,7 @@ class EvaluationScreen(ctk.CTkFrame):
             value="SIM",
             command=lambda i=df_index: self.set_active_by_index(i),
         )
-        yes_btn.pack(side="right", padx=8)
+        yes_btn.pack(side="left", padx=8)
 
         # Store references
         self.finger_widgets[df_index]['quality_buttons'] = quality_buttons
@@ -732,28 +762,44 @@ class EvaluationScreen(ctk.CTkFrame):
 
     def find_closest_box(self, click_x, click_y):
         """Find the closest bounding box to the click position."""
-        if not self.current_task_df.empty:
+        if self.rotated_boxes:
+            for df_index, (x1, y1, x2, y2) in self.rotated_boxes.items():
+                if x1 <= click_x <= x2 and y1 <= click_y <= y2:
+                    return df_index
+
             min_dist = float('inf')
             closest_idx = None
-            for df_index, row in self.current_task_df.iterrows():
-                # Calculate center of box
-                box_x = (int(row['bbox_x1']) + int(row['bbox_x2'])) // 2
-                box_y = (int(row['bbox_y1']) + int(row['bbox_y2'])) // 2
-                # Euclidean distance
-                dist = ((click_x - box_x)**2 + (click_y - box_y)**2)**0.5
+            for df_index, (x1, y1, x2, y2) in self.rotated_boxes.items():
+                box_x = (x1 + x2) // 2
+                box_y = (y1 + y2) // 2
+                dist = ((click_x - box_x) ** 2 + (click_y - box_y) ** 2) ** 0.5
                 if dist < min_dist:
                     min_dist = dist
                     closest_idx = df_index
-            # Only select if within reasonable distance (100px)
-            if min_dist < 100 and closest_idx is not None:
+
+            if min_dist < 160 and closest_idx is not None:
                 return closest_idx
         return None
 
     def on_image_click(self, event):
         """Handle click on image to select finger."""
-        closest_idx = self.find_closest_box(event.x, event.y)
+        if self.render_scale <= 0:
+            return
+
+        # Convert click coordinates from widget space to rotated image space.
+        img_x = (event.x - self.render_offset_x) / self.render_scale
+        img_y = (event.y - self.render_offset_y) / self.render_scale
+
+        if img_x < 0 or img_y < 0:
+            return
+
+        closest_idx = self.find_closest_box(img_x, img_y)
         if closest_idx is not None:
             self.set_active_by_index(closest_idx)
+
+    def on_image_area_resize(self, event=None):
+        if self.current_rotated_img is not None:
+            self.redraw_image_highlight()
 
     def first_incomplete_finger_pos(self):
         for pos, idx in enumerate(self.finger_order):
@@ -762,7 +808,7 @@ class EvaluationScreen(ctk.CTkFrame):
             f1_var = widget_data.get('f1_var')
             if quality_var is None or f1_var is None:
                 return pos
-            if not f1_var.get() or quality_var.get() == 0:
+            if not f1_var.get():
                 return pos
         return 0
 
@@ -824,9 +870,9 @@ class EvaluationScreen(ctk.CTkFrame):
             if show_message:
                 messagebox.showwarning("Atenção", "Defina Sim/Não e a nota de 1 a 5 do dedo ativo antes de avançar.")
             return False
-        if not f1_var.get() or quality_var.get() == 0:
+        if not f1_var.get():
             if show_message:
-                messagebox.showwarning("Atenção", "Defina Sim/Não e a nota de 1 a 5 do dedo ativo antes de avançar.")
+                messagebox.showwarning("Atenção", "Defina Sim/Não e a nota de 0 a 5 do dedo ativo antes de avançar.")
             return False
         return True
 
