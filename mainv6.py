@@ -1,0 +1,1209 @@
+import customtkinter as ctk
+import tkinter as tk
+from tkinter import messagebox, simpledialog
+import os
+import pandas as pd
+from PIL import Image, ImageTk, ImageDraw
+import oracledb
+import io
+import socket
+import datetime
+import traceback
+import threading
+import sys
+import platform
+import ctypes
+from ctypes import wintypes
+
+from version_gate import gate_or_exit
+
+def configure_windows_dpi_awareness():
+    if platform.system() != "Windows":
+        return
+
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
+#versão com escala de qualidade 0-9
+# --- Bloco de Inicialização do Oracle Client ---
+try:
+    is_64bit = platform.architecture()[0] == "64bit"
+    if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+        # Rodando como um executável do PyInstaller
+        client_folder = "instantclient_19_27" if is_64bit else "instantclient_12.2.0.1.0_x86"
+        lib_dir = os.path.join(sys._MEIPASS, client_folder)
+        oracledb.init_oracle_client(lib_dir=lib_dir)
+    else:
+        # Rodando como um script .py normal
+        oracledb.init_oracle_client(lib_dir=r"C:\Oracle\instantclient_12.2.0.1.0_x86")
+except oracledb.DatabaseError as e:
+    messagebox.showerror("Erro Crítico de Banco de Dados",
+                         f"Não foi possível inicializar o Oracle Client. Verifique a instalação e a arquitetura (32/64 bits).\n\nDetalhe: {e}")
+    sys.exit(1)
+
+# --- LÓGICA DE CRIPTOGRAFIA ---
+def encrypt_password(password: str) -> tuple[str | None, str | None]:
+    """
+    Criptografa a senha usando a Senha.dll.
+
+    Retorna uma tupla (encrypted_password, error_message).
+    Se o sucesso, error_message é None.
+    Se falhar, encrypted_password é None.
+    """
+    try:
+        # O caminho para a DLL deve ser relativo ao executável
+        # Se estiver rodando como script, o CWD deve ser a raiz do projeto
+        #dll_path = os.path.join("bin", "Senha.dll")
+
+        # Descobre a pasta-base (normal ou empacotado - sys._MEIPASS)
+        BASE = getattr(sys, "_MEIPASS", os.path.abspath(os.path.dirname(__file__)))
+        dll_dir = os.path.join(BASE, "bin")
+        dll_path = os.path.join(dll_dir, "Senha.dll")  # atenção ao nome
+
+        if not os.path.exists(dll_path):
+            return None, f"Arquivo Senha.dll não encontrado em: {os.path.abspath(dll_path)}"
+
+        senha_dll = ctypes.CDLL(dll_path)
+        
+        CalculaSenhaBD = senha_dll.CalculaSenhaBD
+        CalculaSenhaBD.argtypes = [wintypes.LPCSTR, wintypes.LPSTR]
+        CalculaSenhaBD.restype = None
+
+        output_buffer = ctypes.create_string_buffer(256)
+        
+        CalculaSenhaBD(password.encode('ascii'), output_buffer)
+        
+        encrypted_password = output_buffer.value.decode('ascii')
+        return encrypted_password, None
+
+    except FileNotFoundError:
+        return None, "Não foi possível encontrar o arquivo Senha.dll. Verifique a pasta 'bin'."
+    except AttributeError:
+        return None, "A função 'CalculaSenhaBD' não foi encontrada na Senha.dll."
+    except Exception as e:
+        return None, f"Erro inesperado na criptografia: {e}"
+
+# --- CONFIGURAÇÕES GLOBAIS ---
+IMAGE_FOLDER_PATH = r"\\imagens\Imagens\FRC_RECORTE"
+ORACLE_DSN = 
+# Nomes das tabelas
+TABLE_RECORTE = "FRC.RECORTE"
+TABLE_RECORTE_ANALISE = "FRC.RECORTE_ANALISE"
+TABLE_RECORTE_STATUS = "FRC.RECORTE_STATUS"
+TABLE_OPERADORES ="DETRAN.OPERADORES"
+
+# Códigos de status
+STATUS_PENDENTE = 10
+STATUS_EM_PROCESSAMENTO = 20
+STATUS_CONCLUIDO = 40
+
+try:
+    hostname = socket.gethostname()
+    numeric_id_str = "".join(filter(str.isdigit, hostname))
+    OPERATOR_ID = int(numeric_id_str) if numeric_id_str else 0
+except:
+    OPERATOR_ID = 0
+
+# --- LÓGICA DE NEGÓCIO E DADOS (ORACLE DB) ---
+
+class TaskManager:
+    def __init__(self, user, password, dsn):
+        """Inicializa o TaskManager e estabelece conexão com o Oracle DB."""
+        self.conn = None
+        self.user = user
+        self.password = password
+        self.dsn = dsn
+        try:
+            self.conn = oracledb.connect(user=self.user, password=self.password, dsn=self.dsn)
+            with self.conn.cursor() as cursor:
+                cursor.execute(f"SELECT 1 FROM {TABLE_RECORTE} WHERE 1=0")
+                cursor.execute(f"SELECT 1 FROM {TABLE_RECORTE_ANALISE} WHERE 1=0")
+        except oracledb.DatabaseError as e:
+            messagebox.showerror("Erro de Banco de Dados", f"Não foi possível conectar ao Oracle DB: {e}\n\nVerifique suas credenciais, o DSN e a conexão de rede.")
+            raise
+        except Exception as e:
+            messagebox.showerror("Erro Crítico na Inicialização", f"Ocorreu um erro inesperado: {e}")
+            raise
+
+    def __del__(self):
+        """Garante que a conexão com o banco de dados seja fechada."""
+        if self.conn:
+            self.conn.close()
+
+    def fetch_and_reserve_batch(self, batch_size: int):
+        """Busca um lote de tarefas, reservando-as no banco de dados de forma atômica."""
+        try:
+            with self.conn.cursor() as cursor:
+                self.conn.autocommit = False
+
+                # 1. Busca todas as tarefas pendentes da tabela de recortes
+                sql_fetch_pending = f"""
+                    SELECT
+                        NU_PID, CO_DEDO, FILENAME,
+                        BOX_X, BOX_Y, BOX_W, BOX_H
+                    FROM
+                        {TABLE_RECORTE}
+                    WHERE
+                        TP_RECORTE_STATUS = :status_pendente
+                """
+                cursor.execute(sql_fetch_pending, status_pendente=STATUS_PENDENTE)
+                
+                db_columns = [desc[0].lower() for desc in cursor.description]
+                pending_df = pd.DataFrame(cursor.fetchall(), columns=db_columns)
+
+                if pending_df.empty:
+                    return None, "Todas as avaliações foram concluídas!"
+
+                # 2. Renomeia e calcula colunas para manter a compatibilidade com a UI
+                rename_map = {
+                    'nu_pid': 'nu_pid',
+                    'co_dedo': 'co_dedo',
+                    'filename': 'nome_imagem_digital',
+                    'box_x': 'bbox_x1',
+                    'box_y': 'bbox_y1',
+                    'box_w': 'box_w',
+                    'box_h': 'box_h'
+                }
+                pending_df.rename(columns=rename_map, inplace=True)
+                # Calcula as coordenadas x2, y2 a partir da largura e altura lidas do banco
+                pending_df['bbox_x2'] = pending_df['bbox_x1'] + pending_df['box_w']
+                pending_df['bbox_y2'] = pending_df['bbox_y1'] + pending_df['box_h']
+                
+                # A chave de uma tarefa agora é composta por (nu_pid, co_dedo)
+                pending_df.set_index(['nu_pid', 'co_dedo'], inplace=True)
+
+                # 3. Agrupa tarefas por "mão" (hand), replicando a lógica original
+                def get_person_hand_id(image_name):
+                    try:
+                        parts = os.path.splitext(str(image_name))[0].split('_')
+                        person_id = parts[0]
+                        finger_str = parts[1]
+                        finger_num = int("".join(filter(str.isdigit, finger_str)))
+                        hand_name = "hand1" if 1 <= finger_num <= 5 else "hand2"
+                        return f"{person_id}_{hand_name}"
+                    except (IndexError, ValueError):
+                        return None
+                
+                pending_df['person_hand_id'] = pending_df['nome_imagem_digital'].apply(get_person_hand_id)
+                pending_df.dropna(subset=['person_hand_id'], inplace=True)
+
+                unique_hand_ids = pending_df['person_hand_id'].unique()
+                if len(unique_hand_ids) == 0:
+                    return None, "Não foi possível encontrar tarefas pendentes com formato de nome válido."
+
+                # 4. Seleciona o lote de mãos e reserva as tarefas
+                batch_hand_ids = unique_hand_ids[:batch_size]
+                tasks_to_reserve_df = pending_df[pending_df['person_hand_id'].isin(batch_hand_ids)].copy()
+                task_ids_to_reserve = tasks_to_reserve_df.index.tolist() # Lista de tuplas (nu_pid, co_dedo)
+
+                if not task_ids_to_reserve:
+                    return None, "Nenhuma tarefa encontrada para o lote selecionado."
+
+                # 5. Bloqueia e atualiza as linhas na Tabela de Recorte
+                # A sintaxe de comparação de tuplas pode variar. Esta é comum em Oracle.
+                id_placeholders = ", ".join([f"(:pid{i}, :cid{i})" for i in range(len(task_ids_to_reserve))])
+                lock_sql = f"SELECT NU_PID FROM {TABLE_RECORTE} WHERE (NU_PID, CO_DEDO) IN ({id_placeholders}) AND TP_RECORTE_STATUS = :status_pendente FOR UPDATE"
+                
+                bind_vars = {'status_pendente': STATUS_PENDENTE}
+                for i, (pid, cid) in enumerate(task_ids_to_reserve):
+                    bind_vars[f'pid{i}'] = pid
+                    bind_vars[f'cid{i}'] = cid
+                
+                cursor.execute(lock_sql, bind_vars)
+                
+                locked_rows = cursor.fetchall()
+                if len(locked_rows) != len(task_ids_to_reserve):
+                    self.conn.rollback()
+                    return None, "Conflito de reserva. Outro operador pode ter pego estas tarefas. Tente novamente."
+
+                update_sql = f"UPDATE {TABLE_RECORTE} SET TP_RECORTE_STATUS = :status_proc WHERE NU_PID = :pid AND CO_DEDO = :cid"
+                update_data = [{'status_proc': STATUS_EM_PROCESSAMENTO, 'pid': pid, 'cid': cid} for pid, cid in task_ids_to_reserve]
+                cursor.executemany(update_sql, update_data)
+                
+                self.conn.commit()
+
+                # 6. Formata os dados para a interface gráfica (lógica inalterada)
+                unique_hands = []
+                for hand_id in batch_hand_ids:
+                    hand_tasks_df = tasks_to_reserve_df[tasks_to_reserve_df['person_hand_id'] == hand_id]
+                    # O índice agora é um MultiIndex, mas a lógica de agrupar por 'person_hand_id' continua a mesma
+                    unique_hands.append({
+                        "id": hand_id,
+                        "image_name": f"column_{hand_id}.png",
+                        "tasks": hand_tasks_df
+                    })
+                
+                return unique_hands, None
+
+        except oracledb.DatabaseError as e:
+            if self.conn: self.conn.rollback()
+            return None, f"Erro no banco de dados durante a busca: {e}"
+        finally:
+            if self.conn: self.conn.autocommit = True
+
+
+    def process_image_batch(self, hands_to_process, progress_callback):
+        """Carrega as imagens das mãos a serem processadas. (Lógica inalterada)"""
+        processed_image = {}
+        total_hands = len(hands_to_process)
+
+        if not os.path.isdir(IMAGE_FOLDER_PATH):
+            messagebox.showerror("Erro de Configuração", f"O caminho das imagens não foi encontrado ou não é uma pasta válida:\n{IMAGE_FOLDER_PATH}")
+            return {}
+
+        for i, hand in enumerate(hands_to_process):
+            image_name = hand["image_name"]
+            progress_callback(f"Carregando: {image_name} ({i+1}/{total_hands})")
+            
+            full_image_path = os.path.join(IMAGE_FOLDER_PATH, image_name)
+            
+            try:
+                if not os.path.exists(full_image_path):
+                    raise FileNotFoundError(f"Imagem '{image_name}' não encontrada em:\n{full_image_path}")
+
+                image = Image.open(full_image_path)
+                processed_image[hand["id"]] = image
+
+            except FileNotFoundError as e:
+                messagebox.showerror("Erro ao Carregar Imagem", str(e))
+                processed_image[hand["id"]] = None
+            except Exception as e:
+                messagebox.showerror("Erro Inesperado", f"Falha ao carregar {image_name}: {e}")
+                processed_image[hand["id"]] = None
+        
+        return processed_image
+
+    def update_batch_results(self, evaluated_tasks, unevaluated_tasks, user_id=None):
+        """Atualiza os resultados do lote no banco de dados, inserindo em RECORTE_ANALISE e atualizando status em RECORTE."""
+        try:
+            with self.conn.cursor() as cursor:
+                self.conn.autocommit = False
+                timestamp = datetime.datetime.now()
+
+                # 1. Tarefas concluídas: INSERIR em RECORTE_ANALISE e ATUALIZAR em RECORTE
+                if not evaluated_tasks.empty:
+                    # Insere os resultados na tabela de análise
+                    sql_analise = f"""
+                        INSERT INTO {TABLE_RECORTE_ANALISE} (NU_PID, CO_DEDO, FATOR_1_RECORTE_CORRETO, FATOR_2_QUALIDADE_SUFICIENTE, NU_RICOPER, DT_TRATPEDIDO)
+                        VALUES (:pid, :cid, :f1, :f2, :op_id, :ts)
+                    """
+                    # O driver do oracledb lida com a conversão do objeto datetime do Python diretamente
+                    op_id_value = user_id if user_id is not None else OPERATOR_ID
+                    eval_data_insert = [
+                        {
+                            'pid': int(index[0]),
+                            'cid': int(index[1]),
+                            'f1': 1 if row['fator_1_recorte_correto'] == 'SIM' else 0,
+                            'f2': int(row['fator_2_qualidade_suficiente']),
+                            'op_id': op_id_value, # Mapeado para NU_RICOPER
+                            'ts': timestamp      # Mapeado para DT_TRATPEDIDO
+                        }
+                        for index, row in evaluated_tasks.iterrows()
+                    ]
+                    cursor.executemany(sql_analise, eval_data_insert)
+
+                    # Atualiza o status na tabela de recorte para CONCLUIDO
+                    update_sql_recorte = f"UPDATE {TABLE_RECORTE} SET TP_RECORTE_STATUS = :status WHERE NU_PID = :pid AND CO_DEDO = :cid"
+                    eval_data_update = [
+                        {
+                            'status': STATUS_CONCLUIDO,
+                            'pid': int(index[0]),
+                            'cid': int(index[1])
+                        }
+                        for index, row in evaluated_tasks.iterrows()
+                    ]
+                    cursor.executemany(update_sql_recorte, eval_data_update)
+
+                # 2. Tarefas não concluídas (liberar): ATUALIZAR status em RECORTE para PENDENTE
+                if not unevaluated_tasks.empty:
+                    update_uneval_sql = f"UPDATE {TABLE_RECORTE} SET TP_RECORTE_STATUS = :status WHERE NU_PID = :pid AND CO_DEDO = :cid"
+                    uneval_data = [
+                        {
+                            'status': STATUS_PENDENTE,
+                            'pid': int(index[0]),
+                            'cid': int(index[1])
+                        }
+                        for index, row in unevaluated_tasks.iterrows()
+                    ]
+                    cursor.executemany(update_uneval_sql, uneval_data)
+
+                self.conn.commit()
+                return True
+        except oracledb.DatabaseError as e:
+            if self.conn: self.conn.rollback()
+            messagebox.showerror("Erro de Banco de Dados", f"Falha ao salvar resultados: {e}")
+            return False
+        finally:
+            if self.conn: self.conn.autocommit = True
+
+# --- INTERFACE GRÁFICA ---
+class App(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        self.title("MIcut Avaliator - Centralizado")
+        self.task_manager = None
+        self.current_screen = None
+        self.operator_name = None  # Novo atributo para armazenar o nome do operador
+        self.show_login_screen()
+
+    def get_available_screen_area(self):
+        screen_width = self.winfo_screenwidth()
+        screen_height = self.winfo_screenheight()
+        origin_x = 0
+        origin_y = 0
+
+        try:
+            if platform.system() == "Windows":
+                spi_get_workarea = 0x0030
+                work_area = wintypes.RECT()
+                if ctypes.windll.user32.SystemParametersInfoW(spi_get_workarea, 0, ctypes.byref(work_area), 0):
+                    origin_x = work_area.left
+                    origin_y = work_area.top
+                    screen_width = work_area.right - work_area.left
+                    screen_height = work_area.bottom - work_area.top
+        except Exception:
+            pass
+
+        return origin_x, origin_y, max(480, screen_width), max(320, screen_height)
+
+    def build_adaptive_geometry(self, geometry, margin_x=40, margin_y=60):
+        size_part = geometry.split("+", 1)[0].lower()
+        try:
+            requested_width_str, requested_height_str = size_part.split("x", 1)
+            requested_width = int(requested_width_str)
+            requested_height = int(requested_height_str)
+        except (ValueError, AttributeError):
+            return geometry
+
+        origin_x, origin_y, available_width, available_height = self.get_available_screen_area()
+        fitted_width = min(requested_width, max(480, available_width - margin_x))
+        fitted_height = min(requested_height, max(320, available_height - margin_y))
+
+        pos_x = origin_x + max(0, (available_width - fitted_width) // 2)
+        pos_y = origin_y + max(0, (available_height - fitted_height) // 2)
+
+        return f"{fitted_width}x{fitted_height}+{pos_x}+{pos_y}"
+
+    def show_screen(self, screen_class, *args, **kwargs):
+        if self.current_screen:
+            self.current_screen.destroy()
+        
+        geometry = kwargs.pop("geometry", "500x300") # Smaller default geometry
+        resizable = kwargs.pop("resizable", False)
+        maximize = kwargs.pop("maximize", False)
+
+        self.state("normal")
+        if maximize:
+            origin_x, origin_y, available_width, available_height = self.get_available_screen_area()
+            self.geometry(f"{available_width}x{available_height}+{origin_x}+{origin_y}")
+        else:
+            adaptive_geometry = self.build_adaptive_geometry(geometry)
+            self.geometry(adaptive_geometry)
+        self.resizable(resizable, resizable)
+
+        self.current_screen = screen_class(self, *args, **kwargs)
+        self.current_screen.pack(expand=True, fill="both")
+
+        if maximize and platform.system() == "Windows":
+            self.after(0, lambda: self.state("zoomed"))
+
+    def on_login_success(self, user, password, user_id=None):
+        try:
+            self.task_manager = TaskManager(user, password, ORACLE_DSN)
+            self.logged_user_id = user_id  # Salva o user_id para uso posterior
+            operator_name = user_id  # fallback para o próprio user_id
+            if user_id:
+                try:
+                    with self.task_manager.conn.cursor() as cursor:
+                        sql = f"SELECT NO_OPERADOR FROM {TABLE_OPERADORES} WHERE NU_RICOPER = :user_id"
+                        cursor.execute(sql, user_id=user_id)
+                        result = cursor.fetchone()
+                        if result and result[0]:
+                            operator_name = result[0]
+                except Exception as e:
+                    print(f"Aviso: Não foi possível buscar o nome do operador. Usando o próprio user_id. Erro: {e}")
+            self.operator_name = operator_name  # Salva para uso futuro
+            self.show_batch_selection_screen(operator_name)
+        except oracledb.DatabaseError as e:
+            self.show_login_screen(error=f"Falha na conexão: {e}")
+        except Exception as e:
+            self.show_error_screen(f"Falha na inicialização: {e}")
+
+    def show_login_screen(self, error=None):
+        self.show_screen(LoginScreen, on_login=self.on_login_success, error=error, geometry="500x300", resizable=False)
+
+    def show_batch_selection_screen(self, operator_name=None):
+        if operator_name is None:
+            operator_name = getattr(self, 'operator_name', None)
+        if not operator_name:
+            operator_name = "Operador"
+        self.show_screen(BatchSelectionScreen, operator_name=operator_name, geometry="500x300", resizable=False)
+
+    def show_loading_screen(self, batch_size):
+        self.show_screen(LoadingScreen, batch_size=batch_size, geometry="500x200", resizable=False)
+
+    def show_evaluation_screen(self, batch_data, processed_image):
+        self.show_screen(EvaluationScreen, batch_data=batch_data, processed_image=processed_image, user_id=self.logged_user_id, geometry="1500x900", resizable=True, maximize=True)
+        self.protocol("WM_DELETE_WINDOW", self.current_screen.on_closing)
+
+    def show_error_screen(self, message):
+        self.show_screen(ErrorScreen, message=message)
+
+class LoginScreen(ctk.CTkFrame):
+    def __init__(self, master, on_login, error=None):
+        super().__init__(master)
+        self.master = master
+        self.on_login = on_login
+
+        ctk.CTkLabel(self, text="Login", font=ctk.CTkFont(size=24, weight="bold")).pack(pady=(20,10))
+        
+        ctk.CTkLabel(self, text="Usuário:").pack(pady=(10,0), padx=20, anchor="w")
+        self.user_entry = ctk.CTkEntry(self, width=300)
+        self.user_entry.pack(pady=5, padx=20)
+
+        ctk.CTkLabel(self, text="Senha:").pack(pady=(10,0), padx=20, anchor="w")
+        self.password_entry = ctk.CTkEntry(self, show="*", width=300)
+        self.password_entry.pack(pady=5, padx=20)
+
+        self.login_button = ctk.CTkButton(self, text="Login", command=self.attempt_login, width=300)
+        self.login_button.pack(pady=20, ipady=10)
+
+        self.status_label = ctk.CTkLabel(self, text=error or "", text_color="red")
+        self.status_label.pack(pady=5)
+
+        self.user_entry.bind("<Return>", lambda event: self.attempt_login())
+        self.password_entry.bind("<Return>", lambda event: self.attempt_login())
+
+    def attempt_login(self):
+        user_id = self.user_entry.get()
+        user = "rj" + user_id.zfill(10)
+        plain_password = self.password_entry.get()
+        if not user or not plain_password: messagebox.showerror("Erro de Login", "Usuário e senha não podem estar em branco."); return
+
+        self.status_label.configure(text="Criptografando e conectando...", text_color="#FFFFFF")
+        self.login_button.configure(state="disabled")
+        self.update() # Força a atualização da UI
+
+        encrypted_password, error = encrypt_password(plain_password)
+
+        if error:
+            self.status_label.configure(text=error, text_color="red")
+            self.login_button.configure(state="normal")
+            return
+
+        # Chama o callback para a classe App tentar a conexão, passando também o user_id numérico
+        self.master.after(100, lambda: self.on_login(user, encrypted_password, user_id))
+
+class BatchSelectionScreen(ctk.CTkFrame):
+    def __init__(self, master, operator_name):
+        super().__init__(master)
+        self.master = master
+
+        ctk.CTkLabel(self, text="MIcut Avaliator", font=ctk.CTkFont(size=24, weight="bold")).pack(pady=(20,10))
+        ctk.CTkLabel(self, text=f"Operador: {operator_name}").pack(pady=5)
+        
+        ctk.CTkLabel(self, text="Quantas mãos você vai avaliar nesta sessão?").pack(pady=(20,5))
+        self.batch_size_entry = ctk.CTkEntry(self, justify="center")
+        self.batch_size_entry.pack(pady=5)
+        self.batch_size_entry.insert(0, "10")
+
+
+        ctk.CTkButton(self, text="Iniciar Avaliação", command=self.start_evaluation).pack(pady=20, ipady=10)
+
+        self.batch_size_entry.bind("<Return>", lambda event: self.start_evaluation())
+    def start_evaluation(self):
+        try:
+            batch_size = int(self.batch_size_entry.get())
+            if batch_size <= 0:
+                raise ValueError
+            self.master.show_loading_screen(batch_size)
+        except (ValueError, TypeError):
+            messagebox.showerror("Entrada Inválida", "Por favor, insira um número inteiro positivo.")
+
+class LoadingScreen(ctk.CTkFrame):
+    def __init__(self, master, batch_size):
+        super().__init__(master)
+        self.master = master
+        self.batch_size = batch_size
+
+        self.progress_label = ctk.CTkLabel(self, text="Buscando e reservando tarefas...", font=ctk.CTkFont(size=14))
+        self.progress_label.pack(pady=(40, 10))
+        self.progress_bar = ctk.CTkProgressBar(self, mode='indeterminate')
+        self.progress_bar.pack(pady=10, padx=20, fill="x")
+        self.progress_bar.start()
+
+        self.after(100, self.load_data)
+
+    def load_data(self):
+        threading.Thread(target=self._load_data_thread).start()
+
+    def _load_data_thread(self):
+        batch_data, error = self.master.task_manager.fetch_and_reserve_batch(self.batch_size)
+        if error:
+            # Como estamos em outra thread, precisamos agendar a chamada para a thread principal da UI
+            self.master.after(0, lambda: messagebox.showerror("Erro", error))
+            # Recupera o nome do operador da tela anterior (BatchSelectionScreen)
+            operator_name = None
+            if hasattr(self.master.current_screen, 'operator_name'):
+                operator_name = getattr(self.master.current_screen, 'operator_name', None)
+            if not operator_name:
+                operator_name = getattr(self.master, 'operator_name', None)
+            if not operator_name:
+                operator_name = "Operador"
+            self.master.after(0, lambda: self.master.show_batch_selection_screen(operator_name))
+            return
+
+        def progress_callback(message):
+            # Agendar atualização do label na thread da UI
+            self.master.after(0, self.progress_label.configure, {"text": message})
+
+        processed_image = self.master.task_manager.process_image_batch(batch_data, progress_callback)
+        self.master.after(0, self.on_loading_complete, batch_data, processed_image)
+
+    def on_loading_complete(self, batch_data, processed_image):
+        self.master.show_evaluation_screen(batch_data, processed_image)
+
+class EvaluationScreen(ctk.CTkFrame):
+    def __init__(self, master, batch_data, processed_image, user_id=None):
+        super().__init__(master)
+        self.master = master
+        self.task_manager = master.task_manager
+        self.batch_data = batch_data
+        self.processed_image = processed_image
+        self.user_id = user_id
+        self.current_task_index = 0
+        # O DataFrame de resultados usará o ID da tarefa (do DB) como índice
+        self.results = pd.DataFrame()
+        self.finger_widgets = {}
+        self.finger_order = []
+        self.active_finger_pos = 0
+        self._key_binds = []
+        self.col_photo_image = None
+        self.current_original_img = None
+        self.current_rotated_img = None
+        self.rotated_boxes = {}
+        self.render_scale = 1.0
+        self.render_offset_x = 0
+        self.render_offset_y = 0
+        self.image_pan_x = 0
+        self.max_image_pan_x = 0
+        self.image_scrollbar_thumb_size = 0.2
+
+        self.setup_ui()
+        self.bind_shortcuts()
+        self.load_current_task()
+
+    def setup_ui(self):
+        # Main grid: column 0 = actions (fixed), column 1 = right_panel (flexible)
+        self.grid_columnconfigure(0, weight=0)  # Actions frame - fixed width
+        self.grid_columnconfigure(1, weight=1)  # Right panel - flexible
+        self.grid_rowconfigure(0, weight=1)
+
+        # Left panel: Actions
+        actions_frame = ctk.CTkFrame(self, width=170)
+        actions_frame.grid(row=0, column=0, sticky="nswe", padx=10, pady=10)
+        actions_frame.grid_propagate(False)
+
+        self.progress_label = ctk.CTkLabel(actions_frame, text="", font=ctk.CTkFont(size=14, weight="bold"))
+        self.progress_label.pack(pady=10, padx=10)
+
+        self.finger_progress_label = ctk.CTkLabel(actions_frame, text="", font=ctk.CTkFont(size=13))
+        self.finger_progress_label.pack(pady=(0, 10), padx=10)
+
+        self.next_button = ctk.CTkButton(actions_frame, text="Salvar", command=self.next_task)
+        self.next_button.pack(side="bottom", pady=10, padx=20, fill="x", ipady=10)
+
+        self.save_exit_button = ctk.CTkButton(actions_frame, text="Sair", command=self.on_closing)
+        self.save_exit_button.pack(side="bottom", pady=10, padx=20, fill="x")
+
+        # Right panel: Image (top) + Controls (bottom)
+        self.right_panel = ctk.CTkFrame(self)
+        self.right_panel.grid(row=0, column=1, sticky="nswe", padx=(0, 6), pady=8)
+        self.right_panel.grid_columnconfigure(0, weight=1)
+        self.right_panel.grid_rowconfigure(0, weight=1)  # Image row fills remaining space
+        self.right_panel.grid_rowconfigure(1, weight=0)  # Controls keep natural height
+
+        # Top row: Image frame
+        self.image_frame = ctk.CTkFrame(self.right_panel)
+        self.image_frame.grid(row=0, column=0, sticky="nswe", padx=5, pady=5)
+        self.image_frame.grid_columnconfigure(0, weight=1)
+        self.image_frame.grid_rowconfigure(0, weight=1)
+        self.image_frame.bind("<Configure>", self.on_image_area_resize)
+        self.col_image_label = tk.Label(
+            self.image_frame,
+            text="",
+            bg="white",
+            fg="black",
+            bd=0,
+            highlightthickness=0,
+            anchor="center",
+            justify="center",
+        )
+        self.col_image_label.grid(row=0, column=0, sticky="nswe", padx=5, pady=(5, 2))
+        self.col_image_label.bind("<Button-1>", self.on_image_click)
+        self.image_scrollbar = ctk.CTkScrollbar(
+            self.image_frame,
+            orientation="horizontal",
+            command=self.on_image_scrollbar,
+            height=20,
+            fg_color=("#D0D5DD", "#2F3747"),
+            button_color=("#6B7280", "#98A2B3"),
+            button_hover_color=("#4B5563", "#CBD5E1"),
+        )
+        self.image_scrollbar.grid(row=1, column=0, sticky="ew", padx=5, pady=(0, 5))
+
+        # Bottom row: Controls frame for active finger
+        self.controls_frame = ctk.CTkFrame(self.right_panel)
+        self.controls_frame.grid(row=1, column=0, sticky="nswe", padx=5, pady=5)
+        self.controls_frame.grid_columnconfigure(0, weight=1)
+
+    def bind_shortcuts(self):
+        bindings = {
+            "<Right>": self.on_next_key,
+            "<Return>": self.on_next_key,
+            "<Left>": self.on_prev_key,
+            "<s>": lambda e: self.set_current_f1("SIM"),
+            "<S>": lambda e: self.set_current_f1("SIM"),
+            "<n>": lambda e: self.set_current_f1("NAO"),
+            "<N>": lambda e: self.set_current_f1("NAO"),
+            "<Key-1>": lambda e: self.set_current_quality(1),
+            "<Key-2>": lambda e: self.set_current_quality(2),
+            "<Key-3>": lambda e: self.set_current_quality(3),
+            "<Key-4>": lambda e: self.set_current_quality(4),
+            "<Key-5>": lambda e: self.set_current_quality(5),
+            "<Key-0>": lambda e: self.set_current_quality(0),
+        }
+        for sequence, callback in bindings.items():
+            self.master.bind(sequence, callback)
+            self._key_binds.append(sequence)
+
+    def destroy(self):
+        for sequence in self._key_binds:
+            self.master.unbind(sequence)
+        super().destroy()
+
+    def load_current_task(self):
+        """Load current hand task and display full image with all bounding boxes."""
+        current_hand = self.batch_data[self.current_task_index]
+        self.current_task_df = current_hand["tasks"].copy().sort_index(level='co_dedo')
+        self.finger_widgets = {}
+        self.finger_order = list(self.current_task_df.index)
+        self.active_finger_pos = 0
+
+        # Initialize finger_widgets dict with quality/f1 vars for each finger
+        for df_index, row in self.current_task_df.iterrows():
+            quality_var = ctk.IntVar(value=0)
+            f1_var = ctk.StringVar(value=str(row.get('fator_1_recorte_correto', '')))
+            self.finger_widgets[df_index] = {
+                'quality_var': quality_var,
+                'f1_var': f1_var,
+            }
+
+        self.progress_label.configure(text=f"Avaliando Mão {self.current_task_index + 1} de {len(self.batch_data)}")
+        if self.current_task_index == len(self.batch_data) - 1:
+            self.next_button.configure(text="Finalizar e Salvar Tudo", fg_color="green")
+        else:
+            self.next_button.configure(text="Salvar", fg_color=ctk.ThemeManager.theme["CTkButton"]["fg_color"])
+
+        original_img = self.processed_image.get(current_hand["id"])
+        self.image_pan_x = 0
+        if original_img is None:
+            self.current_original_img = None
+            self.current_rotated_img = None
+            self.rotated_boxes = {}
+            self.max_image_pan_x = 0
+            self.col_photo_image = None
+            self.update_image_scrollbar()
+            self.col_image_label.configure(text=f"Imagem para\n{current_hand['id']}\nnão foi carregada.", image=None)
+            return
+
+        # Store original image and build rotated image/boxes cache for rendering.
+        self.current_original_img = original_img
+        self.current_rotated_img = original_img.rotate(90, expand=True)
+        self.rotated_boxes = {}
+        original_width = original_img.size[0]
+
+        for df_index, row in self.current_task_df.iterrows():
+            rx1, ry1, rx2, ry2 = self.rotate_bbox_90_ccw(
+                int(row['bbox_x1']),
+                int(row['bbox_y1']),
+                int(row['bbox_x2']),
+                int(row['bbox_y2']),
+                original_width,
+            )
+            self.rotated_boxes[df_index] = (
+                min(rx1, rx2),
+                min(ry1, ry2),
+                max(rx1, rx2),
+                max(ry1, ry2),
+            )
+
+        self.focus_set()
+        self.set_active_finger(self.first_incomplete_finger_pos())
+
+    def on_image_scrollbar(self, action, *args):
+        if self.current_rotated_img is None or self.max_image_pan_x <= 0:
+            return
+
+        thumb_size = self.image_scrollbar_thumb_size
+        movable_range = max(0.001, 1.0 - thumb_size)
+
+        if action == "moveto":
+            first = float(args[0])
+        elif action == "scroll":
+            first, _ = self.image_scrollbar.get()
+            step = int(args[0])
+            unit = args[1]
+            increment = 0.05 if unit == "units" else 0.2
+            first += step * increment
+        else:
+            return
+
+        first = max(0.0, min(movable_range, first))
+        pan_fraction = first / movable_range
+        self.image_pan_x = ((pan_fraction * 2) - 1) * self.max_image_pan_x
+        self.redraw_image_highlight()
+
+    def update_image_scrollbar(self):
+        if not hasattr(self, 'image_scrollbar'):
+            return
+
+        if self.current_rotated_img is None or self.max_image_pan_x <= 0:
+            self.image_scrollbar.set(0.0, 1.0)
+            return
+
+        thumb_size = self.image_scrollbar_thumb_size
+        movable_range = max(0.001, 1.0 - thumb_size)
+        pan_fraction = (self.image_pan_x + self.max_image_pan_x) / (2 * self.max_image_pan_x)
+        first = movable_range * pan_fraction
+        last = min(1.0, first + thumb_size)
+
+        self.image_scrollbar.set(first, last)
+
+    def redraw_image_highlight(self):
+        """Redraw the full hand image with all boxes in red, and highlight active finger box in green."""
+        if self.current_rotated_img is None:
+            self.max_image_pan_x = 0
+            self.update_image_scrollbar()
+            return
+
+        display_img = self.current_rotated_img.copy()
+        draw = ImageDraw.Draw(display_img, "RGBA")
+        active_index = self.finger_order[self.active_finger_pos] if self.finger_order else None
+
+        # Draw all transformed boxes in rotated image coordinates.
+        for df_index, box in self.rotated_boxes.items():
+            color = "green" if df_index == active_index else "red"
+            width = 5 if df_index == active_index else 3
+            draw.rectangle(box, outline=color, width=width)
+
+        # Render responsively to occupy most of image area while preserving aspect ratio.
+        self.update_idletasks()
+        widget_w = max(1, self.col_image_label.winfo_width())
+        widget_h = max(1, self.col_image_label.winfo_height())
+        area_w = max(1, widget_w - 10)
+        area_h = max(1, widget_h - 10)
+
+        src_w, src_h = display_img.size
+        ratio = min(area_w / src_w, area_h / src_h)
+        ratio = max(0.1, min(ratio, 2.5))
+
+        new_w = max(1, int(src_w * ratio))
+        new_h = max(1, int(src_h * ratio))
+        display_img = display_img.resize((new_w, new_h), Image.LANCZOS)
+
+        self.render_scale = ratio
+        base_offset_x = (widget_w - new_w) / 2
+        self.max_image_pan_x = max(0, int(base_offset_x - 5))
+        self.image_pan_x = max(-self.max_image_pan_x, min(self.max_image_pan_x, self.image_pan_x))
+        self.render_offset_x = base_offset_x + self.image_pan_x
+        self.render_offset_y = (widget_h - new_h) / 2
+
+        canvas_img = Image.new("RGBA", (widget_w, widget_h), (0, 0, 0, 0))
+        canvas_img.paste(display_img.convert("RGBA"), (int(round(self.render_offset_x)), int(round(self.render_offset_y))))
+
+        self.col_photo_image = ImageTk.PhotoImage(canvas_img)
+        self.col_image_label.configure(image=self.col_photo_image, text="")
+        self.update_image_scrollbar()
+
+    def rotate_bbox_90_ccw(self, x1, y1, x2, y2, orig_w):
+        # PIL rotate(90) => anti-horario (CCW).
+        nx1 = y1
+        ny1 = orig_w - x2
+        nx2 = y2
+        ny2 = orig_w - x1
+        return int(nx1), int(ny1), int(nx2), int(ny2)
+
+    def populate_controls_for_finger(self, df_index):
+        """Populate controls frame with quality and yes/no buttons for the active finger."""
+        # Clear existing controls
+        for widget in self.controls_frame.winfo_children():
+            widget.destroy()
+
+        if df_index not in self.finger_widgets:
+            return
+
+        finger_data = self.finger_widgets[df_index]
+        quality_var = finger_data['quality_var']
+        f1_var = finger_data['f1_var']
+
+        # Quality buttons frame
+        quality_frame = ctk.CTkFrame(self.controls_frame, fg_color="transparent")
+        quality_frame.grid(row=0, column=0, sticky="ew", padx=8, pady=(4, 2))
+        quality_frame.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(quality_frame, text="Qualidade:").pack(side="left")
+
+        quality_buttons_frame = ctk.CTkFrame(quality_frame, fg_color="transparent")
+        quality_buttons_frame.pack(side="left", padx=(10, 0))
+
+        quality_buttons = {}
+        for idx, label in enumerate(["?", "1", "2", "3", "4", "5"]):
+            value = 0 if label == "?" else int(label)
+            btn = ctk.CTkRadioButton(
+                quality_buttons_frame,
+                text=label,
+                variable=quality_var,
+                value=value,
+                width=38,
+                command=lambda i=df_index: self.set_active_by_index(i),
+            )
+            btn.pack(side="left", padx=(0, 6))
+            quality_buttons[value] = btn
+
+        # Correctness frame
+        f1_frame = ctk.CTkFrame(self.controls_frame, fg_color="transparent")
+        f1_frame.grid(row=1, column=0, sticky="ew", padx=8, pady=(2, 8))
+        ctk.CTkLabel(f1_frame, text="Recorte correto?").pack(side="left")
+
+        no_btn = ctk.CTkRadioButton(
+            f1_frame,
+            text="Não",
+            variable=f1_var,
+            value="NAO",
+            command=lambda i=df_index: self.set_active_by_index(i),
+        )
+        no_btn.pack(side="left", padx=8)
+
+        yes_btn = ctk.CTkRadioButton(
+            f1_frame,
+            text="Sim",
+            variable=f1_var,
+            value="SIM",
+            command=lambda i=df_index: self.set_active_by_index(i),
+        )
+        yes_btn.pack(side="left", padx=8)
+
+        # Store references
+        self.finger_widgets[df_index]['quality_buttons'] = quality_buttons
+        self.finger_widgets[df_index]['yes_btn'] = yes_btn
+        self.finger_widgets[df_index]['no_btn'] = no_btn
+
+    def find_closest_box(self, click_x, click_y):
+        """Find the closest bounding box to the click position."""
+        if self.rotated_boxes:
+            for df_index, (x1, y1, x2, y2) in self.rotated_boxes.items():
+                if x1 <= click_x <= x2 and y1 <= click_y <= y2:
+                    return df_index
+
+            min_dist = float('inf')
+            closest_idx = None
+            for df_index, (x1, y1, x2, y2) in self.rotated_boxes.items():
+                box_x = (x1 + x2) // 2
+                box_y = (y1 + y2) // 2
+                dist = ((click_x - box_x) ** 2 + (click_y - box_y) ** 2) ** 0.5
+                if dist < min_dist:
+                    min_dist = dist
+                    closest_idx = df_index
+
+            if min_dist < 160 and closest_idx is not None:
+                return closest_idx
+        return None
+
+    def on_image_click(self, event):
+        """Handle click on image to select finger."""
+        if self.render_scale <= 0:
+            return
+
+        # Convert click coordinates from widget space to rotated image space.
+        img_x = (event.x - self.render_offset_x) / self.render_scale
+        img_y = (event.y - self.render_offset_y) / self.render_scale
+
+        if img_x < 0 or img_y < 0:
+            return
+        if self.current_rotated_img is not None:
+            if img_x > self.current_rotated_img.width or img_y > self.current_rotated_img.height:
+                return
+
+        closest_idx = self.find_closest_box(img_x, img_y)
+        if closest_idx is not None:
+            self.set_active_by_index(closest_idx)
+
+    def on_image_area_resize(self, event=None):
+        if self.current_rotated_img is not None:
+            self.redraw_image_highlight()
+
+    def first_incomplete_finger_pos(self):
+        for pos, idx in enumerate(self.finger_order):
+            widget_data = self.finger_widgets.get(idx, {})
+            quality_var = widget_data.get('quality_var')
+            f1_var = widget_data.get('f1_var')
+            if quality_var is None or f1_var is None:
+                return pos
+            if not f1_var.get():
+                return pos
+        return 0
+
+    def set_active_by_index(self, df_index):
+        if df_index in self.finger_order:
+            self.set_active_finger(self.finger_order.index(df_index))
+
+    def set_active_finger(self, pos):
+        if not self.finger_order:
+            self.finger_progress_label.configure(text="")
+            return
+
+        pos = max(0, min(pos, len(self.finger_order) - 1))
+        self.active_finger_pos = pos
+        active_index = self.finger_order[pos]
+
+        # Populate controls for active finger
+        self.populate_controls_for_finger(active_index)
+        
+        # Redraw image with active finger highlighted in green
+        self.redraw_image_highlight()
+
+        self.finger_progress_label.configure(text=f"Dedo {self.active_finger_pos + 1} de {len(self.finger_order)}")
+
+    def scroll_active_into_view(self):
+        """Deprecated: no longer needed with new layout."""
+        pass
+
+    def current_finger_index(self):
+        if not self.finger_order:
+            return None
+        return self.finger_order[self.active_finger_pos]
+
+    def set_current_quality(self, value):
+        current_idx = self.current_finger_index()
+        if current_idx is None:
+            return "break"
+        widget_data = self.finger_widgets.get(current_idx)
+        if widget_data and 'quality_var' in widget_data:
+            widget_data['quality_var'].set(value)
+        self.set_active_by_index(current_idx)
+        return "break"
+
+    def set_current_f1(self, value):
+        current_idx = self.current_finger_index()
+        if current_idx is None:
+            return "break"
+        widget_data = self.finger_widgets.get(current_idx)
+        if widget_data and 'f1_var' in widget_data:
+            widget_data['f1_var'].set(value)
+        self.set_active_by_index(current_idx)
+        return "break"
+
+    def validate_finger(self, df_index, show_message=True):
+        widget_data = self.finger_widgets.get(df_index, {})
+        quality_var = widget_data.get('quality_var')
+        f1_var = widget_data.get('f1_var')
+        if quality_var is None or f1_var is None:
+            if show_message:
+                messagebox.showwarning("Atenção", "Defina Sim/Não e a nota de 1 a 5 do dedo ativo antes de avançar.")
+            return False
+        if not f1_var.get():
+            if show_message:
+                messagebox.showwarning("Atenção", "Defina Sim/Não e a nota de 0 a 5 do dedo ativo antes de avançar.")
+            return False
+        return True
+
+    def on_next_key(self, event=None):
+        if not self.finger_order:
+            return "break"
+
+        current_idx = self.current_finger_index()
+        if current_idx is None:
+            return "break"
+
+        if not self.validate_finger(current_idx, show_message=True):
+            return "break"
+
+        if self.active_finger_pos < len(self.finger_order) - 1:
+            self.set_active_finger(self.active_finger_pos + 1)
+        else:
+            self.next_task()
+        return "break"
+
+    def on_prev_key(self, event=None):
+        if self.active_finger_pos > 0:
+            self.set_active_finger(self.active_finger_pos - 1)
+        return "break"
+
+    def next_task(self):
+        # Validate all fingers have been evaluated
+        for index in self.finger_order:
+            if not self.validate_finger(index, show_message=False):
+                messagebox.showwarning("Atenção", "Por favor, avalie todos os dedos (Sim/Não e qualidade 1 a 5).")
+                return
+
+        # Map evaluated values from finger_widgets back to current_task_df
+        for index in self.finger_order:
+            widget_data = self.finger_widgets.get(index, {})
+            quality_var = widget_data.get('quality_var')
+            f1_var = widget_data.get('f1_var')
+            if quality_var and f1_var:
+                self.current_task_df.loc[index, 'fator_1_recorte_correto'] = f1_var.get()
+                self.current_task_df.loc[index, 'fator_2_qualidade_suficiente'] = quality_var.get()
+
+        self.results = pd.concat([self.results, self.current_task_df.drop(columns=['f1_var', 'f2_var'], errors='ignore')])
+
+        if self.current_task_index < len(self.batch_data) - 1:
+            self.current_task_index += 1
+            self.load_current_task()
+        else:
+            self.on_closing(final_save=True)
+
+    def on_closing(self, final_save=False):
+        if not final_save:
+            if not messagebox.askyesno("Confirmar Saída", "Tem certeza que deseja sair? Apenas as MÃOS 100% concluídas serão salvas. O progresso em mãos parcialmente avaliadas será perdido."):
+                return
+
+        # Lógica para salvar apenas mãos completas
+        all_tasks_df = pd.concat([hand["tasks"] for hand in self.batch_data])
+
+        completed_hand_ids = []
+        if not self.results.empty:
+            # Agrupa os dedos avaliados por 'mão'
+            evaluated_fingers_by_hand = self.results.groupby('person_hand_id')
+
+            for hand_data in self.batch_data:
+                hand_id = hand_data["id"]
+                total_fingers_in_hand = len(hand_data["tasks"])
+                
+                # Verifica se a mão teve algum dedo avaliado
+                if hand_id in evaluated_fingers_by_hand.groups:
+                    evaluated_count = len(evaluated_fingers_by_hand.get_group(hand_id))
+                    # Se todos os dedos da mão foram avaliados, marca a mão como completa
+                    if evaluated_count == total_fingers_in_hand:
+                        completed_hand_ids.append(hand_id)
+
+        # Separa os dataframes com base nas mãos completas
+        tasks_to_save_df = all_tasks_df[all_tasks_df['person_hand_id'].isin(completed_hand_ids)]
+        tasks_to_release_df = all_tasks_df[~all_tasks_df['person_hand_id'].isin(completed_hand_ids)]
+
+        # Adiciona os resultados da avaliação ao dataframe que será salvo
+        if not tasks_to_save_df.empty:
+            # Garante que o dataframe de resultados tenha o mesmo tipo de índice que o de tarefas
+            results_to_merge = self.results.reset_index().set_index(['nu_pid', 'co_dedo'])
+            tasks_to_save_df = tasks_to_save_df.merge(
+                results_to_merge[['fator_1_recorte_correto', 'fator_2_qualidade_suficiente']],
+                left_index=True,
+                right_index=True,
+                how='left'
+            )
+
+        self.task_manager.update_batch_results(tasks_to_save_df, tasks_to_release_df, self.user_id)
+        
+        if final_save:
+            messagebox.showinfo("Sucesso", "Lote de avaliação concluído e salvo com sucesso!")
+        else:
+            messagebox.showinfo("Progresso Salvo", "Seu progresso foi salvo. Tarefas de mãos incompletas foram liberadas.")
+
+        self.master.protocol("WM_DELETE_WINDOW", self.master.destroy)
+        # Recupera o nome do operador da tela anterior (BatchSelectionScreen)
+        operator_name = None
+        if hasattr(self.master.current_screen, 'operator_name'):
+            operator_name = getattr(self.master.current_screen, 'operator_name', None)
+        if not operator_name:
+            operator_name = getattr(self.master, 'operator_name', None)
+        if not operator_name:
+            operator_name = "Operador"
+        self.master.show_batch_selection_screen(operator_name)
+
+class ErrorScreen(ctk.CTkFrame):
+    def __init__(self, master, message):
+        super().__init__(master)
+        ctk.CTkLabel(self, text="Ocorreu um erro irrecuperável:", text_color="red").pack(pady=(20,5))
+        ctk.CTkLabel(self, text=message, wraplength=480).pack(pady=5, padx=10)
+
+class ZoomWindow(ctk.CTkToplevel):
+    def __init__(self, master, image: Image.Image):
+        super().__init__(master)
+        self.title("Zoom (Scroll para zoom, clique e arraste para mover)")
+        self.geometry("800x600")
+        self.transient(master)
+        self.focus_force()
+
+        self.canvas = ctk.CTkCanvas(self, width=800, height=600, bg="#2B2B2B", highlightthickness=0)
+        self.canvas.pack(fill="both", expand=True)
+
+        self.original_image = image
+        self.scale = 1.0
+        self.position = [400, 300]
+        self.photo_image = None
+
+        self._drag_data = {"x": 0, "y": 0}
+
+        self.canvas.bind("<MouseWheel>", self.on_mouse_wheel)
+        self.canvas.bind("<ButtonPress-1>", self.on_button_press)
+        self.canvas.bind("<B1-Motion>", self.on_move)
+
+        self.update_idletasks()  
+        self._set_initial_zoom()
+        self.redraw()
+
+    def _set_initial_zoom(self):
+        canvas_w = max(1, self.canvas.winfo_width())
+        canvas_h = max(1, self.canvas.winfo_height())
+        img_w, img_h = self.original_image.size
+
+        fit_scale = min(canvas_w / img_w, canvas_h / img_h)
+
+        self.scale = min(fit_scale * 1.35, 4.0)
+
+        self.position = [canvas_w / 2, canvas_h / 2]
+
+    def redraw(self):
+        if self.scale < 0.1: self.scale = 0.1
+        width = int(self.original_image.width * self.scale)
+        height = int(self.original_image.height * self.scale)
+        resized_image = self.original_image.resize((width, height), Image.LANCZOS)
+        self.photo_image = ImageTk.PhotoImage(resized_image)
+        self.canvas.delete("all")
+        self.canvas.create_image(self.position[0], self.position[1], anchor="center", image=self.photo_image)
+
+    def on_mouse_wheel(self, event):
+        scale_factor = 1.1 if event.delta > 0 else 0.9
+        mouse_x, mouse_y = event.x, event.y
+        img_coord_x = mouse_x - self.position[0]
+        img_coord_y = mouse_y - self.position[1]
+        self.position[0] -= img_coord_x * (scale_factor - 1)
+        self.position[1] -= img_coord_y * (scale_factor - 1)
+        self.scale *= scale_factor
+        self.redraw()
+
+    def on_button_press(self, event):
+        self._drag_data["x"] = event.x
+        self._drag_data["y"] = event.y
+
+    def on_move(self, event):
+        dx = event.x - self._drag_data["x"]
+        dy = event.y - self._drag_data["y"]
+        self.position[0] += dx
+        self.position[1] += dy
+        self._drag_data["x"] = event.x
+        self._drag_data["y"] = event.y
+        self.redraw()
+
+if __name__ == "__main__":
+    configure_windows_dpi_awareness()
+    gate_or_exit()
+    ctk.set_appearance_mode("System")
+    ctk.set_default_color_theme("blue")
+    app = App()
+    app.mainloop()
