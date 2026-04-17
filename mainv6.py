@@ -40,7 +40,7 @@ try:
         oracledb.init_oracle_client(lib_dir=lib_dir)
     else:
         # Rodando como um script .py normal
-        oracledb.init_oracle_client(lib_dir=r"C:\Oracle\instantclient_12.2.0.1.0_x86")
+        oracledb.init_oracle_client(lib_dir=ORACLE_CLIENT_LIB_DIR)
 except oracledb.DatabaseError as e:
     messagebox.showerror("Erro Crítico de Banco de Dados",
                          f"Não foi possível inicializar o Oracle Client. Verifique a instalação e a arquitetura (32/64 bits).\n\nDetalhe: {e}")
@@ -90,7 +90,7 @@ def encrypt_password(password: str) -> tuple[str | None, str | None]:
 
 # --- CONFIGURAÇÕES GLOBAIS ---
 IMAGE_FOLDER_PATH = r"\\imagens\Imagens\FRC_RECORTE"
-ORACLE_DSN = 
+ORACLE_DSN = ORACLE_DSN
 # Nomes das tabelas
 TABLE_RECORTE = "FRC.RECORTE"
 TABLE_RECORTE_ANALISE = "FRC.RECORTE_ANALISE"
@@ -515,6 +515,7 @@ class BatchSelectionScreen(ctk.CTkFrame):
 
         ctk.CTkButton(self, text="Iniciar Avaliação", command=self.start_evaluation).pack(pady=20, ipady=10)
 
+        self.batch_size_entry.focus_set()
         self.batch_size_entry.bind("<Return>", lambda event: self.start_evaluation())
     def start_evaluation(self):
         try:
@@ -923,9 +924,33 @@ class EvaluationScreen(ctk.CTkFrame):
             if min_dist < 160 and closest_idx is not None:
                 return closest_idx
         return None
+    
+    def extract_crop_from_box(self, df_index):
+        """Extract a padded crop from the rotated image for the given finger index."""
+        if self.current_rotated_img is None or df_index not in self.rotated_boxes:
+            return None
 
+        # Get x,y of the box in rotated image coordinates
+        x1, y1, x2, y2 = self.rotated_boxes[df_index]
+        box_w = max(1, x2 - x1)
+        box_h = max(1, y2 - y1)
+
+        # Small proportional padding keeps the finger visible without cutting off edges.
+        pad_x = max(12, int(box_w * 0.15))
+        pad_y = max(12, int(box_h * 0.15))
+
+        left = max(0, int(x1) - pad_x)
+        top = max(0, int(y1) - pad_y)
+        right = min(self.current_rotated_img.width, int(x2) + pad_x)
+        bottom = min(self.current_rotated_img.height, int(y2) + pad_y)
+
+        if right <= left or bottom <= top:
+            return None
+
+        return self.current_rotated_img.crop((left, top, right, bottom))
+    
     def on_image_click(self, event):
-        """Handle click on image to select finger."""
+        """Handle click on image to open a zoom of the box crop."""
         if self.render_scale <= 0:
             return
 
@@ -941,7 +966,10 @@ class EvaluationScreen(ctk.CTkFrame):
 
         closest_idx = self.find_closest_box(img_x, img_y)
         if closest_idx is not None:
-            self.set_active_by_index(closest_idx)
+            # self.set_active_by_index(closest_idx)
+            crop_img = self.extract_crop_from_box(closest_idx)
+            if crop_img is not None:
+                ZoomWindow(self.master, crop_img)
 
     def on_image_area_resize(self, event=None):
         if self.current_rotated_img is not None:
@@ -1045,6 +1073,11 @@ class EvaluationScreen(ctk.CTkFrame):
         return "break"
 
     def next_task(self):
+
+        if self.finger_order and self.active_finger_pos == len(self.finger_order) - 1:
+            if not messagebox.askyesno("Confirmar", "Você está no último dedo desta mão. Tem certeza que deseja avançar para a próxima mão?"):
+                return
+
         # Validate all fingers have been evaluated
         for index in self.finger_order:
             if not self.validate_finger(index, show_message=False):

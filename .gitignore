@@ -14,3 +14,4 @@ import_data.py
 senha_crypto.py
 import_data.py
 reset_database.py
+.env
